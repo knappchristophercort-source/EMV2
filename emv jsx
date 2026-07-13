@@ -1,0 +1,7 @@
+const toggleStep = (row, i) => {
+  const next = {...pattern};
+  next[row] = [...pattern[row]];
+  next[row][i] = next[row][i] ? 0 : 1;
+  setPattern(next);
+  sequencer.setPattern(next);
+};
