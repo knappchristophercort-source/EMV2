@@ -1,0 +1,126 @@
+mport { useState, useRef, useEffect } from "react";
+
+// ── Audio Context ─────────────────────────────────────────────────────────────
+let actx = null;
+function getCtx() {
+  if (!actx || actx.state === "closed") actx = new (window.AudioContext || window.webkitAudioContext)();
+  return actx;
+}
+async function resumeCtx() { const c = getCtx(); if (c.state !== "running") await c.resume(); return c; }
+
+function noteToFreq(note) {
+  const map = {C:0,D:2,E:4,F:5,G:7,A:9,B:11};
+  const m = note.match(/^([A-G])(#|b)?(-?\d)$/);
+  if (!m) return 220;
+  let s = map[m[1]]; if (m[2]==="#") s++; if (m[2]==="b") s--;
+  return 440 * Math.pow(2, (s - 9 + (parseInt(m[3]) - 4) * 12) / 12);
+}
+
+function makeDistCurve(amt) {
+  const n=256,c=new Float32Array(n),k=amt*300;
+  for(let i=0;i<n;i++){const x=(i*2)/n-1;c[i]=((Math.PI+k)*x)/(Math.PI+k*Math.abs(x));}
+  return c;
+}
+
+function routeToDestination(ctx, node, {reverb=0,delay=0,distortion=0}) {
+  let last=node;
+  if(distortion>0){const ws=ctx.createWaveShaper();ws.curve=makeDistCurve(distortion);ws.oversample="4x";last.connect(ws);last=ws;}
+  if(delay>0){const d=ctx.createDelay(2),fb=ctx.createGain(),dw=ctx.createGain();d.delayTime.value=0.28*delay;fb.gain.value=delay*0.42;dw.gain.value=0.5;last.connect(d);d.connect(fb);fb.connect(d);d.connect(dw);dw.connect(ctx.destination);last.connect(ctx.destination);return;}
+  if(reverb>0){const conv=ctx.createConvolver(),len=ctx.sampleRate*(0.4+reverb*3),buf=ctx.createBuffer(2,len,ctx.sampleRate);for(let ch=0;ch<2;ch++){const d=buf.getChannelData(ch);for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/len,1+reverb*2);}conv.buffer=buf;const wet=ctx.createGain(),dry=ctx.createGain();wet.gain.value=reverb*0.65;dry.gain.value=1-reverb*0.35;last.connect(conv);conv.connect(wet);wet.connect(ctx.destination);last.connect(dry);dry.connect(ctx.destination);return;}
+  last.connect(ctx.destination);
+}
+
+async function playNote(p) {
+  const ctx=await resumeCtx();
+  const {freq,type="sine",attack=0.05,release=1.2,vol=0.35,reverb=0,delay=0,distortion=0}=p;
+  const now=ctx.currentTime;
+  const osc=ctx.createOscillator(),env=ctx.createGain();
+  osc.type=type;osc.frequency.value=freq;
+  env.gain.setValueAtTime(0,now);env.gain.linearRampToValueAtTime(vol,now+attack);
+  env.gain.setValueAtTime(vol,now+attack+0.2);env.gain.linearRampToValueAtTime(0,now+attack+0.2+release);
+  osc.connect(env);routeToDestination(ctx,env,{reverb,delay,distortion});
+  osc.start(now);osc.stop(now+attack+0.2+release+0.1);
+}
+
+const heldNodes={};
+async function holdNote(id,p) {
+  releaseNote(id);
+  const ctx=await resumeCtx();
+  const {freq,type="sine",attack=0.06,vol=0.32,reverb=0,delay=0,distortion=0}=p;
+  const now=ctx.currentTime;
+  const osc=ctx.createOscillator(),env=ctx.createGain();
+  osc.type=type;osc.frequency.value=freq;
+  env.gain.setValueAtTime(0,now);env.gain.linearRampToValueAtTime(vol,now+attack);
+  osc.connect(env);routeToDestination(ctx,env,{reverb,delay,distortion});
+  osc.start(now);heldNodes[id]={osc,env,ctx};
+}
+function releaseNote(id) {
+  const n=heldNodes[id];if(!n)return;
+  const now=n.ctx.currentTime;
+  n.env.gain.cancelScheduledValues(now);n.env.gain.setValueAtTime(n.env.gain.value,now);
+  n.env.gain.linearRampToValueAtTime(0,now+0.6);n.osc.stop(now+0.65);delete heldNodes[id];
+}
+
+// ── Pitch Detection (autocorrelation) ─────────────────────────────────────────
+function detectPitch(buffer, sampleRate) {
+  // Work on a 4096-sample window from the middle of the buffer (most signal there)
+  const start = Math.max(0, Math.floor(buffer.length / 2) - 2048);
+  const SIZE = Math.min(4096, buffer.length - start);
+  const buf = buffer.slice ? buffer.slice(start, start + SIZE) : Array.from(buffer).slice(start, start + SIZE);
+
+  // RMS — very low threshold to catch hums and quiet instruments
+  let rms = 0;
+  for (let i = 0; i < SIZE; i++) rms += buf[i] * buf[i];
+  rms = Math.sqrt(rms / SIZE);
+  if (rms < 0.001) return { freq: null, rms, confidence: 0 }; // genuine silence
+
+  // Autocorrelation
+  const MAX = Math.floor(SIZE / 2);
+  let bestOffset = -1, bestCorr = 0, lastCorr = 1;
+  for (let offset = 1; offset < MAX; offset++) {
+    let corr = 0;
+    for (let i = 0; i < MAX; i++) corr += buf[i] * buf[i + offset];
+    corr = corr / MAX;
+    if (corr > bestCorr && corr > lastCorr) { bestCorr = corr; bestOffset = offset; }
+    lastCorr = corr;
+  }
+
+  if (bestOffset < 2) return { freq: null, rms, confidence: 0 };
+  const freq = sampleRate / bestOffset;
+  // Only return plausible musical frequencies (27Hz = A0, 4186Hz = C8)
+  if (freq < 27 || freq > 4200) return { freq: null, rms, confidence: bestCorr };
+  return { freq, rms, confidence: bestCorr };
+}
+
+// Scan entire audio buffer across multiple windows, return best pitch hit
+function analyzePitch(audioBuffer) {
+  const sr = audioBuffer.sampleRate;
+  const data = audioBuffer.getChannelData(0);
+  const windowSize = 4096;
+  const hop = Math.floor(windowSize / 2);
+  const results = [];
+
+  for (let i = 0; i + windowSize < data.length; i += hop) {
+    const window = Array.from(data.slice(i, i + windowSize));
+    const r = detectPitch(window, sr);
+    if (r.freq && r.rms > 0.001) results.push(r);
+  }
+
+  if (!results.length) return { freq: null, note: null, rms: 0 };
+
+  // Pick the result with highest RMS (loudest, clearest moment)
+  results.sort((a, b) => b.rms - a.rms);
+  const best = results[0];
+  return { freq: best.freq, note: freqToNote(best.freq), rms: best.rms };
+}
+
+function freqToNote(freq) {
+  if (!freq || freq < 20) return null;
+  const noteNames = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+  const midi = Math.round(12 * Math.log2(freq / 440) + 69);
+  const note = noteNames[midi % 12];
+  const octave = Math.floor(midi / 12) - 1;
+  return `${note}${octave}`;
+}
+
+// ── Beat Sequencer ─────────────────
