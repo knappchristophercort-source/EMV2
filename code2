@@ -1,0 +1,59 @@
+class BeatSequencer {
+  constructor(){this.bpm=90;this.playing=false;this.step=0;this.nextTime=0;this.timer=null;this.onStep=null;this.pattern={kick:[],snare:[],hihat:[]};}
+  kick(t,ctx){const o=ctx.createOscillator(),g=ctx.createGain();o.type="sine";o.frequency.setValueAtTime(160,t);o.frequency.exponentialRampToValueAtTime(40,t+0.09);g.gain.setValueAtTime(0.85,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.28);o.connect(g);g.connect(ctx.destination);o.start(t);o.stop(t+0.32);}
+  snare(t,ctx){const len=ctx.sampleRate*0.18,buf=ctx.createBuffer(1,len,ctx.sampleRate),d=buf.getChannelData(0);for(let i=0;i<len;i++)d[i]=Math.random()*2-1;const n=ctx.createBufferSource(),f=ctx.createBiquadFilter(),g=ctx.createGain();n.buffer=buf;f.type="bandpass";f.frequency.value=1900;g.gain.setValueAtTime(0.55,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.18);n.connect(f);f.connect(g);g.connect(ctx.destination);n.start(t);n.stop(t+0.22);const o=ctx.createOscillator(),g2=ctx.createGain();o.type="triangle";o.frequency.value=195;g2.gain.setValueAtTime(0.28,t);g2.gain.exponentialRampToValueAtTime(0.001,t+0.1);o.connect(g2);g2.connect(ctx.destination);o.start(t);o.stop(t+0.12);}
+  hihat(t,ctx,open=false){const dur=open?0.28:0.045,len=ctx.sampleRate*dur,buf=ctx.createBuffer(1,len,ctx.sampleRate),d=buf.getChannelData(0);for(let i=0;i<len;i++)d[i]=Math.random()*2-1;const n=ctx.createBufferSource(),f=ctx.createBiquadFilter(),g=ctx.createGain();n.buffer=buf;f.type="highpass";f.frequency.value=8000;g.gain.setValueAtTime(open?0.18:0.14,t);g.gain.exponentialRampToValueAtTime(0.001,t+dur);n.connect(f);f.connect(g);g.connect(ctx.destination);n.start(t);n.stop(t+dur+0.02);}
+  schedule(){
+    if(!actx)return;
+    const ctx=actx,sps=(60/this.bpm)/4,ahead=0.12;
+    while(this.nextTime<ctx.currentTime+ahead){
+      const s=this.step,t=this.nextTime;
+      if(this.pattern.kick[s])this.kick(t,ctx);
+      if(this.pattern.snare[s])this.snare(t,ctx);
+      if(this.pattern.hihat[s])this.hihat(t,ctx,s%8===0);
+      if(this.onStep)this.onStep(s);
+      this.step=(s+1)%16;this.nextTime+=sps;
+    }
+    this.timer=setTimeout(()=>this.schedule(),22);
+  }
+  async start(){if(this.playing)return;const ctx=await resumeCtx();this.playing=true;this.step=0;this.nextTime=ctx.currentTime+0.05;this.schedule();}
+  stop(){this.playing=false;if(this.timer)clearTimeout(this.timer);this.timer=null;}
+  setPattern(p){this.pattern={kick:[...p.kick],snare:[...p.snare],hihat:[...p.hihat]};}
+  setBPM(b){this.bpm=b;}
+}
+const sequencer=new BeatSequencer();
+
+// ── Visualizer ────────────────────────────────────────────────────────────────
+function Visualizer({playing,recording}) {
+  const ref=useRef(null),raf=useRef(null);
+  useEffect(()=>{
+    const c=ref.current;if(!c)return;
+    const ctx=c.getContext("2d");let t=0;
+    const draw=()=>{
+      raf.current=requestAnimationFrame(draw);t+=0.018;
+      const W=c.width,H=c.height;
+      ctx.clearRect(0,0,W,H);
+      ctx.strokeStyle="rgba(255,255,255,0.03)";ctx.lineWidth=1;
+      [H*.25,H*.5,H*.75].forEach(y=>{ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();});
+      const amp=recording?35:(playing?28:(Object.keys(heldNodes).length>0?20:3));
+      const spd=recording?2.2:(playing?1.8:1);
+      const color=recording?"#F87171":"#A78BFA";
+      ctx.lineWidth=1.5;ctx.shadowBlur=recording?28:(playing?20:5);ctx.shadowColor=color;
+      const g=ctx.createLinearGradient(0,0,W,0);
+      g.addColorStop(0,`rgba(${recording?"248,113,113":"124,58,237"},0.05)`);
+      g.addColorStop(0.5,color);
+      g.addColorStop(1,`rgba(${recording?"248,113,113":"124,58,237"},0.05)`);
+      ctx.strokeStyle=g;
+      ctx.beginPath();
+      for(let x=0;x<W;x++){
+        const y=H/2+Math.sin(x*0.016+t*spd)*amp+Math.sin(x*0.041+t*spd*1.4)*(amp*0.35)+Math.sin(x*0.008+t*spd*0.6)*(amp*0.2);
+        x===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+    };
+    draw();return()=>cancelAnimationFrame(raf.current);
+  },[playing,recording]);
+  return <canvas ref={ref} width={900} height={80} style={{width:"100%",height:"100%",display:"block"}}/>;
+}
+
+// ── Step Grid ───────────────────────────────────────────────────────
