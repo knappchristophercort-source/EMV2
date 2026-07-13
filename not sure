@@ -1,0 +1,4 @@
+{rows.map(row => (
+  // ...
+  <span>{row === "eight08" ? "808" : labels[row]}</span>
+))}
