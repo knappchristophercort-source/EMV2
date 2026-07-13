@@ -1,0 +1,38 @@
+ .gitignore | 24 ++++
+ LICENSE    | 201 ++++++++
+ 2 files changed, 225 insertions(+)
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+build/
+dist/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage/
+
+# Misc
+*.log
+.cache/
