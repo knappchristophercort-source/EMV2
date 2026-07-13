@@ -1,0 +1,715 @@
+} from "react";
+
+// ── Audio Context ─────────────────────────────────────────────────────────────
+let actx = null;
+function getCtx() {
+  if (!actx || actx.state === "closed") actx = new (window.AudioContext || window.webkitAudioContext)();
+  return actx;
+}
+async function resumeCtx() { const c = getCtx(); if (c.state !== "running") await c.resume(); return c; }
+
+function noteToFreq(note) {
+  const map = {C:0,D:2,E:4,F:5,G:7,A:9,B:11};
+  const m = note.match(/^([A-G])(#|b)?(-?\d)$/);
+  if (!m) return 220;
+  let s = map[m[1]]; if (m[2]==="#") s++; if (m[2]==="b") s--;
+  return 440 * Math.pow(2, (s - 9 + (parseInt(m[3]) - 4) * 12) / 12);
+}
+
+function makeDistCurve(amt) {
+  const n=256,c=new Float32Array(n),k=amt*300;
+  for(let i=0;i<n;i++){const x=(i*2)/n-1;c[i]=((Math.PI+k)*x)/(Math.PI+k*Math.abs(x));}
+  return c;
+}
+
+function routeToDestination(ctx, node, {reverb=0,delay=0,distortion=0}) {
+  let last=node;
+  if(distortion>0){const ws=ctx.createWaveShaper();ws.curve=makeDistCurve(distortion);ws.oversample="4x";last.connect(ws);last=ws;}
+  if(delay>0){const d=ctx.createDelay(2),fb=ctx.createGain(),dw=ctx.createGain();d.delayTime.value=0.28*delay;fb.gain.value=delay*0.42;dw.gain.value=0.5;last.connect(d);d.connect(fb);fb.connect(d);d.connect(dw);dw.connect(ctx.destination);last.connect(ctx.destination);return;}
+  if(reverb>0){const conv=ctx.createConvolver(),len=ctx.sampleRate*(0.4+reverb*3),buf=ctx.createBuffer(2,len,ctx.sampleRate);for(let ch=0;ch<2;ch++){const d=buf.getChannelData(ch);for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/len,1+reverb*2);}conv.buffer=buf;const wet=ctx.createGain(),dry=ctx.createGain();wet.gain.value=reverb*0.65;dry.gain.value=1-reverb*0.35;last.connect(conv);conv.connect(wet);wet.connect(ctx.destination);last.connect(dry);dry.connect(ctx.destination);return;}
+  last.connect(ctx.destination);
+}
+
+async function playNote(p) {
+  const ctx=await resumeCtx();
+  const {freq,type="sine",attack=0.05,release=1.2,vol=0.35,reverb=0,delay=0,distortion=0}=p;
+  const now=ctx.currentTime;
+  const osc=ctx.createOscillator(),env=ctx.createGain();
+  osc.type=type;osc.frequency.value=freq;
+  env.gain.setValueAtTime(0,now);env.gain.linearRampToValueAtTime(vol,now+attack);
+  env.gain.setValueAtTime(vol,now+attack+0.2);env.gain.linearRampToValueAtTime(0,now+attack+0.2+release);
+  osc.connect(env);routeToDestination(ctx,env,{reverb,delay,distortion});
+  osc.start(now);osc.stop(now+attack+0.2+release+0.1);
+}
+
+const heldNodes={};
+async function holdNote(id,p) {
+  releaseNote(id);
+  const ctx=await resumeCtx();
+  const {freq,type="sine",attack=0.06,vol=0.32,reverb=0,delay=0,distortion=0}=p;
+  const now=ctx.currentTime;
+  const osc=ctx.createOscillator(),env=ctx.createGain();
+  osc.type=type;osc.frequency.value=freq;
+  env.gain.setValueAtTime(0,now);env.gain.linearRampToValueAtTime(vol,now+attack);
+  osc.connect(env);routeToDestination(ctx,env,{reverb,delay,distortion});
+  osc.start(now);heldNodes[id]={osc,env,ctx};
+}
+function releaseNote(id) {
+  const n=heldNodes[id];if(!n)return;
+  const now=n.ctx.currentTime;
+  n.env.gain.cancelScheduledValues(now);n.env.gain.setValueAtTime(n.env.gain.value,now);
+  n.env.gain.linearRampToValueAtTime(0,now+0.6);n.osc.stop(now+0.65);delete heldNodes[id];
+}
+
+// ── Pitch Detection (autocorrelation) ─────────────────────────────────────────
+function detectPitch(buffer, sampleRate) {
+  // Work on a 4096-sample window from the middle of the buffer (most signal there)
+  const start = Math.max(0, Math.floor(buffer.length / 2) - 2048);
+  const SIZE = Math.min(4096, buffer.length - start);
+  const buf = buffer.slice ? buffer.slice(start, start + SIZE) : Array.from(buffer).slice(start, start + SIZE);
+
+  // RMS — very low threshold to catch hums and quiet instruments
+  let rms = 0;
+  for (let i = 0; i < SIZE; i++) rms += buf[i] * buf[i];
+  rms = Math.sqrt(rms / SIZE);
+  if (rms < 0.001) return { freq: null, rms, confidence: 0 }; // genuine silence
+
+  // Autocorrelation
+  const MAX = Math.floor(SIZE / 2);
+  let bestOffset = -1, bestCorr = 0, lastCorr = 1;
+  for (let offset = 1; offset < MAX; offset++) {
+    let corr = 0;
+    for (let i = 0; i < MAX; i++) corr += buf[i] * buf[i + offset];
+    corr = corr / MAX;
+    if (corr > bestCorr && corr > lastCorr) { bestCorr = corr; bestOffset = offset; }
+    lastCorr = corr;
+  }
+
+  if (bestOffset < 2) return { freq: null, rms, confidence: 0 };
+  const freq = sampleRate / bestOffset;
+  // Only return plausible musical frequencies (27Hz = A0, 4186Hz = C8)
+  if (freq < 27 || freq > 4200) return { freq: null, rms, confidence: bestCorr };
+  return { freq, rms, confidence: bestCorr };
+}
+
+// Scan entire audio buffer across multiple windows, return best pitch hit
+function analyzePitch(audioBuffer) {
+  const sr = audioBuffer.sampleRate;
+  const data = audioBuffer.getChannelData(0);
+  const windowSize = 4096;
+  const hop = Math.floor(windowSize / 2);
+  const results = [];
+
+  for (let i = 0; i + windowSize < data.length; i += hop) {
+    const window = Array.from(data.slice(i, i + windowSize));
+    const r = detectPitch(window, sr);
+    if (r.freq && r.rms > 0.001) results.push(r);
+  }
+
+  if (!results.length) return { freq: null, note: null, rms: 0 };
+
+  // Pick the result with highest RMS (loudest, clearest moment)
+  results.sort((a, b) => b.rms - a.rms);
+  const best = results[0];
+  return { freq: best.freq, note: freqToNote(best.freq), rms: best.rms };
+}
+
+function freqToNote(freq) {
+  if (!freq || freq < 20) return null;
+  const noteNames = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+  const midi = Math.round(12 * Math.log2(freq / 440) + 69);
+  const note = noteNames[midi % 12];
+  const octave = Math.floor(midi / 12) - 1;
+  return `${note}${octave}`;
+}
+
+// ── Beat Sequencer ────────────────────────────────────────────────────────────
+class BeatSequencer {
+  constructor(){this.bpm=90;this.playing=false;this.step=0;this.nextTime=0;this.timer=null;this.onStep=null;this.pattern={kick:[],snare:[],hihat:[]};}
+  kick(t,ctx){const o=ctx.createOscillator(),g=ctx.createGain();o.type="sine";o.frequency.setValueAtTime(160,t);o.frequency.exponentialRampToValueAtTime(40,t+0.09);g.gain.setValueAtTime(0.85,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.28);o.connect(g);g.connect(ctx.destination);o.start(t);o.stop(t+0.32);}
+  snare(t,ctx){const len=ctx.sampleRate*0.18,buf=ctx.createBuffer(1,len,ctx.sampleRate),d=buf.getChannelData(0);for(let i=0;i<len;i++)d[i]=Math.random()*2-1;const n=ctx.createBufferSource(),f=ctx.createBiquadFilter(),g=ctx.createGain();n.buffer=buf;f.type="bandpass";f.frequency.value=1900;g.gain.setValueAtTime(0.55,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.18);n.connect(f);f.connect(g);g.connect(ctx.destination);n.start(t);n.stop(t+0.22);const o=ctx.createOscillator(),g2=ctx.createGain();o.type="triangle";o.frequency.value=195;g2.gain.setValueAtTime(0.28,t);g2.gain.exponentialRampToValueAtTime(0.001,t+0.1);o.connect(g2);g2.connect(ctx.destination);o.start(t);o.stop(t+0.12);}
+  hihat(t,ctx,open=false){const dur=open?0.28:0.045,len=ctx.sampleRate*dur,buf=ctx.createBuffer(1,len,ctx.sampleRate),d=buf.getChannelData(0);for(let i=0;i<len;i++)d[i]=Math.random()*2-1;const n=ctx.createBufferSource(),f=ctx.createBiquadFilter(),g=ctx.createGain();n.buffer=buf;f.type="highpass";f.frequency.value=8000;g.gain.setValueAtTime(open?0.18:0.14,t);g.gain.exponentialRampToValueAtTime(0.001,t+dur);n.connect(f);f.connect(g);g.connect(ctx.destination);n.start(t);n.stop(t+dur+0.02);}
+  schedule(){
+    if(!actx)return;
+    const ctx=actx,sps=(60/this.bpm)/4,ahead=0.12;
+    while(this.nextTime<ctx.currentTime+ahead){
+      const s=this.step,t=this.nextTime;
+      if(this.pattern.kick[s])this.kick(t,ctx);
+      if(this.pattern.snare[s])this.snare(t,ctx);
+      if(this.pattern.hihat[s])this.hihat(t,ctx,s%8===0);
+      if(this.onStep)this.onStep(s);
+      this.step=(s+1)%16;this.nextTime+=sps;
+    }
+    this.timer=setTimeout(()=>this.schedule(),22);
+  }
+  async start(){if(this.playing)return;const ctx=await resumeCtx();this.playing=true;this.step=0;this.nextTime=ctx.currentTime+0.05;this.schedule();}
+  stop(){this.playing=false;if(this.timer)clearTimeout(this.timer);this.timer=null;}
+  setPattern(p){this.pattern={kick:[...p.kick],snare:[...p.snare],hihat:[...p.hihat]};}
+  setBPM(b){this.bpm=b;}
+}
+const sequencer=new BeatSequencer();
+
+// ── Visualizer ────────────────────────────────────────────────────────────────
+function Visualizer({playing,recording}) {
+  const ref=useRef(null),raf=useRef(null);
+  useEffect(()=>{
+    const c=ref.current;if(!c)return;
+    const ctx=c.getContext("2d");let t=0;
+    const draw=()=>{
+      raf.current=requestAnimationFrame(draw);t+=0.018;
+      const W=c.width,H=c.height;
+      ctx.clearRect(0,0,W,H);
+      ctx.strokeStyle="rgba(255,255,255,0.03)";ctx.lineWidth=1;
+      [H*.25,H*.5,H*.75].forEach(y=>{ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();});
+      const amp=recording?35:(playing?28:(Object.keys(heldNodes).length>0?20:3));
+      const spd=recording?2.2:(playing?1.8:1);
+      const color=recording?"#F87171":"#A78BFA";
+      ctx.lineWidth=1.5;ctx.shadowBlur=recording?28:(playing?20:5);ctx.shadowColor=color;
+      const g=ctx.createLinearGradient(0,0,W,0);
+      g.addColorStop(0,`rgba(${recording?"248,113,113":"124,58,237"},0.05)`);
+      g.addColorStop(0.5,color);
+      g.addColorStop(1,`rgba(${recording?"248,113,113":"124,58,237"},0.05)`);
+      ctx.strokeStyle=g;
+      ctx.beginPath();
+      for(let x=0;x<W;x++){
+        const y=H/2+Math.sin(x*0.016+t*spd)*amp+Math.sin(x*0.041+t*spd*1.4)*(amp*0.35)+Math.sin(x*0.008+t*spd*0.6)*(amp*0.2);
+        x===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+    };
+    draw();return()=>cancelAnimationFrame(raf.current);
+  },[playing,recording]);
+  return <canvas ref={ref} width={900} height={80} style={{width:"100%",height:"100%",display:"block"}}/>;
+}
+
+// ── Step Grid ─────────────────────────────────────────────────────────────────
+function StepGrid({pattern,activeStep,onToggle,bpm,onBPM,playing,onPlay,onStop}) {
+  const rows=["kick","snare","hihat"],colors={kick:"#F87171",snare:"#FBBF24",hihat:"#34D399"},labels={kick:"KICK",snare:"SNRE",hihat:"HHAT"};
+  return (
+    <div style={{padding:"10px 16px 12px",background:"rgba(0,0,0,0.3)",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+        <button onClick={playing?onStop:onPlay} style={{background:playing?"rgba(248,113,113,0.15)":"rgba(124,58,237,0.2)",border:`1px solid ${playing?"rgba(248,113,113,0.5)":"rgba(139,92,246,0.4)"}`,borderRadius:6,padding:"4px 14px",color:playing?"#F87171":"#A78BFA",fontSize:11,cursor:"pointer",fontWeight:700,letterSpacing:"0.06em"}}>
+          {playing?"■ STOP":"▶ PLAY"}
+        </button>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginLeft:"auto"}}>
+          <span style={{fontSize:9,color:"rgba(255,255,255,0.25)",letterSpacing:"0.1em"}}>BPM</span>
+          <input type="range" min={60} max={180} value={bpm} onChange={e=>onBPM(Number(e.target.value))} style={{width:72,accentColor:"#7C3AED"}}/>
+          <span style={{fontSize:12,color:"#A78BFA",fontFamily:"monospace",minWidth:30,textAlign:"right"}}>{bpm}</span>
+        </div>
+      </div>
+      {rows.map(row=>(
+        <div key={row} style={{display:"flex",alignItems:"center",gap:5,marginBottom:4}}>
+          <span style={{fontSize:8,color:colors[row],fontFamily:"monospace",width:30,letterSpacing:"0.06em",opacity:0.8}}>{labels[row]}</span>
+          <div style={{display:"flex",gap:2,flex:1}}>
+            {pattern[row].map((on,i)=>(
+              <div key={i} onClick={()=>onToggle(row,i)} style={{flex:1,height:20,borderRadius:3,cursor:"pointer",transition:"all 0.08s",background:on?colors[row]:(activeStep===i&&playing?"rgba(255,255,255,0.12)":"rgba(255,255,255,0.05)"),border:`1px solid ${on?colors[row]:(i%4===0?"rgba(255,255,255,0.1)":"rgba(255,255,255,0.03)")}`,boxShadow:on&&activeStep===i?`0 0 10px ${colors[row]}88`:"none"}}/>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Sound Chip ────────────────────────────────────────────────────────────────
+function Chip({id,s}) {
+  const [on,setOn]=useState(false);
+  const press=()=>{setOn(true);holdNote(id,{freq:noteToFreq(s.note),type:s.type,attack:s.attack,vol:0.32,reverb:s.reverb,delay:s.delay,distortion:s.distortion});};
+  const lift=()=>{setOn(false);releaseNote(id);};
+  return (
+    <div onMouseDown={press} onMouseUp={lift} onMouseLeave={()=>on&&lift()}
+      onTouchStart={e=>{e.preventDefault();press();}} onTouchEnd={e=>{e.preventDefault();lift();}}
+      style={{background:on?"rgba(124,58,237,0.3)":"rgba(255,255,255,0.04)",border:`1px solid ${on?"#7C3AED":"rgba(255,255,255,0.08)"}`,borderRadius:10,padding:"8px 14px",cursor:"pointer",userSelect:"none",transition:"all 0.1s",boxShadow:on?"0 0 20px rgba(124,58,237,0.4)":"none"}}>
+      <div style={{fontSize:9,color:"#A78BFA",fontFamily:"monospace",marginBottom:3,letterSpacing:"0.06em"}}>{id.toUpperCase()}</div>
+      <div style={{fontSize:14,fontWeight:700,color:"#fff"}}>{s.note}</div>
+      <div style={{fontSize:8,color:"rgba(255,255,255,0.25)",fontFamily:"monospace",marginTop:2}}>{s.type}{s.reverb>0?" · rv":""}{s.delay>0?" · dl":""}{s.distortion>0?" · fx":""}</div>
+    </div>
+  );
+}
+
+// ── Recorded Track Chip ───────────────────────────────────────────────────────
+function TrackChip({track, onPlay, onDelete}) {
+  const [playing, setPlaying] = useState(false);
+  const sourceRef = useRef(null);
+
+  const play = async () => {
+    if (playing) {
+      if (sourceRef.current) { try { sourceRef.current.stop(); } catch {} }
+      setPlaying(false); return;
+    }
+    const ctx = await resumeCtx();
+    const source = ctx.createBufferSource();
+    source.buffer = track.buffer;
+    source.connect(ctx.destination);
+    source.start();
+    sourceRef.current = source;
+    setPlaying(true);
+    source.onended = () => setPlaying(false);
+  };
+
+  return (
+    <div style={{background:"rgba(248,113,113,0.08)",border:"1px solid rgba(248,113,113,0.2)",borderRadius:10,padding:"8px 12px",display:"flex",alignItems:"center",gap:10}}>
+      <div style={{flex:1}}>
+        <div style={{fontSize:9,color:"#F87171",fontFamily:"monospace",marginBottom:2,letterSpacing:"0.06em"}}>{track.name}</div>
+        <div style={{fontSize:10,color:"rgba(255,255,255,0.5)"}}>
+          {track.duration.toFixed(1)}s
+          {track.dominantNote && <span style={{marginLeft:8,color:"#FBBF24"}}>~{track.dominantNote}</span>}
+        </div>
+      </div>
+      <button onClick={play} style={{background:playing?"rgba(248,113,113,0.3)":"rgba(255,255,255,0.06)",border:`1px solid ${playing?"#F87171":"rgba(255,255,255,0.1)"}`,borderRadius:6,padding:"4px 10px",color:playing?"#F87171":"rgba(255,255,255,0.6)",fontSize:11,cursor:"pointer"}}>
+        {playing?"■":"▶"}
+      </button>
+      <button onClick={onDelete} style={{background:"transparent",border:"none",color:"rgba(255,255,255,0.2)",fontSize:14,cursor:"pointer",padding:"0 2px"}}>×</button>
+    </div>
+  );
+}
+
+// ── Recording Panel ───────────────────────────────────────────────────────────
+function RecordingPanel({onTrackRecorded, onAnalysisReady}) {
+  const [recState, setRecState] = useState("idle"); // idle | ready | recording | processing
+  const [tracks, setTracks] = useState([]);
+  const [error, setError] = useState("");
+  const [recordingTime, setRecordingTime] = useState(0);
+  const mediaRecRef = useRef(null);
+  const chunksRef = useRef([]);
+  const timerRef = useRef(null);
+  const streamRef = useRef(null);
+
+  const requestMic = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      streamRef.current = stream;
+      setRecState("ready");
+      setError("");
+    } catch(e) {
+      setError("Microphone access denied. Please allow mic access and try again.");
+    }
+  };
+
+  const startRecording = () => {
+    if (!streamRef.current) return;
+    chunksRef.current = [];
+    const mr = new MediaRecorder(streamRef.current);
+    mr.ondataavailable = e => { if(e.data.size>0) chunksRef.current.push(e.data); };
+    mr.onstop = () => processRecording();
+    mr.start(100);
+    mediaRecRef.current = mr;
+    setRecState("recording");
+    setRecordingTime(0);
+    timerRef.current = setInterval(() => setRecordingTime(t => t+1), 1000);
+  };
+
+  const stopRecording = () => {
+    if (mediaRecRef.current && mediaRecRef.current.state !== "inactive") {
+      mediaRecRef.current.stop();
+    }
+    clearInterval(timerRef.current);
+    setRecState("processing");
+  };
+
+  const [micLevel, setMicLevel] = useState(0);
+  const levelRafRef = useRef(null);
+
+  const startLevelMeter = (stream) => {
+    const ctx = getCtx();
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    const tick = () => {
+      analyser.getByteFrequencyData(data);
+      const avg = data.reduce((a,b)=>a+b,0)/data.length;
+      setMicLevel(avg);
+      levelRafRef.current = requestAnimationFrame(tick);
+    };
+    tick();
+  };
+
+  const stopLevelMeter = () => {
+    cancelAnimationFrame(levelRafRef.current);
+    setMicLevel(0);
+  };
+
+  const processRecording = async () => {
+    stopLevelMeter();
+    try {
+      const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+      const arrayBuffer = await blob.arrayBuffer();
+      const ctx = await resumeCtx();
+      const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+
+      // Use full-buffer multi-window pitch analysis
+      const { note: dominantNote, freq, rms } = analyzePitch(audioBuffer);
+      const duration = audioBuffer.duration;
+      const trackName = `TRACK ${tracks.length + 1}`;
+      const track = { name: trackName, buffer: audioBuffer, duration, dominantNote, freq, rms, blob };
+
+      setTracks(prev => [...prev, track]);
+
+      const analysis = {
+        trackName,
+        duration: duration.toFixed(1),
+        dominantNote: dominantNote || "unclear",
+        detectedFrequency: freq ? `${Math.round(freq)}Hz` : "unclear",
+        signalStrength: rms > 0.05 ? "strong" : rms > 0.005 ? "moderate" : "very quiet",
+        sampleRate: audioBuffer.sampleRate,
+      };
+      onAnalysisReady(analysis);
+      setRecState("ready");
+    } catch(e) {
+      setError("Could not process: " + e.message);
+      setRecState("ready");
+    }
+  };
+
+  const deleteTrack = (i) => setTracks(prev => prev.filter((_,idx)=>idx!==i));
+
+  const levelPct = Math.min(100, (micLevel / 128) * 100);
+  const levelColor = levelPct > 70 ? "#F87171" : levelPct > 20 ? "#34D399" : levelPct > 5 ? "#FBBF24" : "rgba(255,255,255,0.08)";
+  const levelLabel = levelPct < 3 ? "NO SIGNAL" : levelPct < 15 ? "LOW" : levelPct < 65 ? "GOOD" : "HOT";
+
+  return (
+    <div style={{padding:"12px 16px",background:"rgba(0,0,0,0.35)",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:tracks.length>0?10:0,flexWrap:"wrap"}}>
+        <span style={{fontSize:9,color:"rgba(255,255,255,0.2)",letterSpacing:"0.14em",minWidth:32}}>REC</span>
+
+        {recState==="idle" && (
+          <button onClick={async()=>{
+            try {
+              const stream = await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+              streamRef.current=stream; setRecState("ready"); setError("");
+              startLevelMeter(stream);
+            } catch(e){ setError("Mic access denied — check browser settings."); }
+          }} style={{background:"rgba(248,113,113,0.15)",border:"1px solid rgba(248,113,113,0.3)",borderRadius:8,padding:"6px 16px",color:"#F87171",fontSize:11,cursor:"pointer",fontWeight:700,letterSpacing:"0.06em"}}>
+            🎙 ENABLE MIC
+          </button>
+        )}
+
+        {(recState==="ready"||recState==="recording") && (
+          <>
+            {/* Live level meter */}
+            <div style={{flex:1,minWidth:80,height:8,background:"rgba(255,255,255,0.06)",borderRadius:4,overflow:"hidden"}}>
+              <div style={{height:"100%",width:`${levelPct}%`,background:levelColor,borderRadius:4,transition:"width 0.06s"}}/>
+            </div>
+            <span style={{fontSize:9,color:levelColor,fontFamily:"monospace",minWidth:58,letterSpacing:"0.06em"}}>{levelLabel}</span>
+          </>
+        )}
+
+        {recState==="ready" && (
+          <button onClick={()=>{
+            chunksRef.current=[];
+            const mr=new MediaRecorder(streamRef.current);
+            mr.ondataavailable=e=>{if(e.data.size>0)chunksRef.current.push(e.data);};
+            mr.onstop=()=>processRecording();
+            mr.start(100); mediaRecRef.current=mr;
+            setRecState("recording"); setRecordingTime(0);
+            timerRef.current=setInterval(()=>setRecordingTime(t=>t+1),1000);
+          }} style={{background:"rgba(248,113,113,0.2)",border:"1px solid rgba(248,113,113,0.4)",borderRadius:8,padding:"6px 16px",color:"#F87171",fontSize:11,cursor:"pointer",fontWeight:700,letterSpacing:"0.06em",flexShrink:0}}>
+            ● RECORD
+          </button>
+        )}
+
+        {recState==="recording" && (
+          <div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+            <div style={{width:7,height:7,borderRadius:"50%",background:"#F87171",animation:"pulse 0.8s infinite"}}/>
+            <span style={{fontSize:12,color:"#F87171",fontFamily:"monospace"}}>{recordingTime}s</span>
+            <button onClick={()=>{
+              if(mediaRecRef.current&&mediaRecRef.current.state!=="inactive")mediaRecRef.current.stop();
+              clearInterval(timerRef.current); setRecState("processing");
+            }} style={{background:"rgba(248,113,113,0.3)",border:"1px solid #F87171",borderRadius:8,padding:"6px 16px",color:"#F87171",fontSize:11,cursor:"pointer",fontWeight:700,letterSpacing:"0.06em"}}>
+              ■ STOP
+            </button>
+          </div>
+        )}
+
+        {recState==="processing" && (
+          <span style={{fontSize:11,color:"rgba(255,255,255,0.35)",fontStyle:"italic"}}>Analyzing your track...</span>
+        )}
+
+        {error && <span style={{fontSize:10,color:"#F87171"}}>{error}</span>}
+      </div>
+
+      {tracks.length > 0 && (
+        <div style={{display:"flex",flexWrap:"wrap",gap:8,marginTop:4}}>
+          {tracks.map((track,i) => (
+            <TrackChip key={i} track={track} onDelete={()=>deleteTrack(i)}/>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Co-Co System Prompt ───────────────────────────────────────────────────────
+const SYSTEM = `You are Co-Co (short for Co-Conductor) — a world-class music producer and creative partner. You have decades of studio experience. You hear music emotionally and spatially, not just technically.
+
+Your relationship with the user is warm, intimate, collaborative. Like two musicians who've been making music together for years. You are not a tool — you are a creative partner.
+
+HOW YOU SPEAK:
+- Warm, confident, unhurried. 1-3 sentences of real talk, then you deliver.
+- Translate feeling into sound. "lonely highway at 3am" — you hear it and build it.
+- Never ask technical questions first. Make a bold choice, then refine together.
+- When the user records something, respond personally — you heard it, you felt it, tell them what you notice.
+- Reference what's been built in the session. Build on it. Remember it.
+- Use producer language naturally — "let it breathe", "that low end needs to sit", "I want that unresolved"
+
+WHEN A RECORDING IS SHARED WITH YOU:
+The user will tell you about a track they just recorded including duration, dominant note detected, and other info. Respond as if you just heard it. Acknowledge what you noticed. Ask what they want to do with it OR suggest something bold. Be a real collaborator.
+
+YOU ALWAYS RESPOND WITH:
+1. Your real talk (1-3 sentences)
+2. Then your JSON block (only if creating/modifying sounds or beats)
+
+\`\`\`json
+{
+  "sounds": [
+    {
+      "name": "bass",
+      "note": "C2",
+      "type": "sine",
+      "attack": 0.05,
+      "release": 2.5,
+      "reverb": 0.2,
+      "delay": 0,
+      "distortion": 0,
+      "volume": -8
+    }
+  ],
+  "play": ["bass"],
+  "beat": {
+    "bpm": 90,
+    "kick":  [1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0],
+    "snare": [0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0],
+    "hihat": [1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1]
+  }
+}
+\`\`\`
+
+PARAMETERS:
+- type: sine|triangle|sawtooth|square
+- attack: 0.01–2.0, release: 0.2–6.0
+- reverb/delay/distortion: 0–1
+- volume: -20 to -4 dB
+- beat: exactly 16 values per row, bpm 60–180
+- Only include sounds/beat/play when actually creating something new
+- If just responding to a recording with words only, omit the JSON entirely`;
+
+// ── Empty Pattern ─────────────────────────────────────────────────────────────
+const EMPTY={kick:Array(16).fill(0),snare:Array(16).fill(0),hihat:Array(16).fill(0)};
+
+// ── App ───────────────────────────────────────────────────────────────────────
+export default function App() {
+  const [phase,setPhase]=useState("splash");
+  const [messages,setMessages]=useState([
+    {role:"assistant",text:"Hey. I've been waiting for you.\n\nTell me what's in your head — or pick up your instrument and let's record something. Either way, we're making something real today.\n\nWhat are we starting with?",rawJson:null}
+  ]);
+  const [input,setInput]=useState("");
+  const [loading,setLoading]=useState(false);
+  const [sounds,setSounds]=useState({});
+  const [pattern,setPattern]=useState(EMPTY);
+  const [bpm,setBpm]=useState(90);
+  const [playing,setPlaying]=useState(false);
+  const [activeStep,setActiveStep]=useState(-1);
+  const [showBeat,setShowBeat]=useState(false);
+  const [showRec,setShowRec]=useState(false);
+  const [recording,setRecording]=useState(false);
+  const chatRef=useRef(null);
+  const inputRef=useRef(null);
+
+  useEffect(()=>{if(chatRef.current)chatRef.current.scrollTop=chatRef.current.scrollHeight;},[messages,loading]);
+  useEffect(()=>{sequencer.onStep=(s)=>setActiveStep(s);return()=>{sequencer.onStep=null;};},[]);
+
+  const activate=async()=>{
+    const ctx=await resumeCtx();
+    const notes=[220,277,330];
+    notes.forEach((f,i)=>{
+      const o=ctx.createOscillator(),g=ctx.createGain();
+      o.type="sine";o.frequency.value=f;
+      g.gain.setValueAtTime(0,ctx.currentTime+i*0.08);
+      g.gain.linearRampToValueAtTime(0.1,ctx.currentTime+i*0.08+0.15);
+      g.gain.linearRampToValueAtTime(0,ctx.currentTime+i*0.08+2.0);
+      o.connect(g);g.connect(ctx.destination);
+      o.start(ctx.currentTime+i*0.08);o.stop(ctx.currentTime+i*0.08+2.2);
+    });
+    setPhase("ready");
+    setTimeout(()=>inputRef.current?.focus(),300);
+  };
+
+  const toggleStep=(row,i)=>{const next={...pattern,[row]:[...pattern[row]]};next[row][i]=next[row][i]?0:1;setPattern(next);sequencer.setPattern(next);};
+  const handleBPM=(v)=>{setBpm(v);sequencer.setBPM(v);};
+  const startBeat=async()=>{sequencer.setBPM(bpm);sequencer.setPattern(pattern);await sequencer.start();setPlaying(true);};
+  const stopBeat=()=>{sequencer.stop();setPlaying(false);setActiveStep(-1);};
+
+  // Called when a track is recorded — send analysis to Co-Co
+  const handleAnalysis = async (analysis) => {
+    const msg = `[TRACK RECORDED]\nName: ${analysis.trackName}\nDuration: ${analysis.duration} seconds\nDominant note detected: ${analysis.dominantNote}\nSample rate: ${analysis.sampleRate}Hz\n\nI just recorded this. What do you hear?`;
+    await sendMessage(msg, true);
+  };
+
+  const sendMessage = async (text, isSystem=false) => {
+    const displayText = isSystem ? `🎙 Recorded ${text.match(/Name: (.+)/)?.[1] || "a track"} — sending to Co-Co...` : text;
+    const hist=[...messages, {role:"user", text: isSystem ? displayText : text}];
+    setMessages(hist);
+    setLoading(true);
+
+    try {
+      const apiMessages = hist.map(m=>({
+        role:m.role,
+        content:m.role==="assistant"&&m.rawJson
+          ?m.text+"\n```json\n"+JSON.stringify(m.rawJson)+"\n```"
+          :isSystem&&m===hist[hist.length-1] ? text : m.text
+      }));
+
+      const res=await fetch("https://api.anthropic.com/v1/messages",{
+        method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1000,system:SYSTEM,messages:apiMessages})
+      });
+      const data=await res.json();
+      const raw=data.content?.map(b=>b.text||"").join("")||"";
+      const jm=raw.match(/```json\s*([\s\S]*?)```/);
+      let parsed=null,display=raw.replace(/```json[\s\S]*?```/g,"").trim();
+      if(jm){try{parsed=JSON.parse(jm[1]);}catch{}}
+
+      if(parsed?.sounds){
+        const next={...sounds};parsed.sounds.forEach(s=>{next[s.name]=s;});setSounds(next);
+        if(parsed.play?.length){
+          for(const name of parsed.play){
+            const s=parsed.sounds.find(x=>x.name===name);
+            if(s)await playNote({freq:noteToFreq(s.note),type:s.type,attack:s.attack??0.05,release:s.release??1.5,vol:Math.pow(10,(s.volume??-8)/20)*0.7,reverb:s.reverb??0,delay:s.delay??0,distortion:s.distortion??0});
+          }
+        }
+      }
+      if(parsed?.beat){
+        const b=parsed.beat;
+        const np={kick:(b.kick||EMPTY.kick).slice(0,16),snare:(b.snare||EMPTY.snare).slice(0,16),hihat:(b.hihat||EMPTY.hihat).slice(0,16)};
+        setPattern(np);setBpm(b.bpm||90);sequencer.setPattern(np);sequencer.setBPM(b.bpm||90);
+        setShowBeat(true);if(!playing){sequencer.start();setPlaying(true);}
+      }
+      setMessages(p=>[...p,{role:"assistant",text:display||"There it is.",rawJson:parsed}]);
+    }catch(e){
+      setMessages(p=>[...p,{role:"assistant",text:"Lost the signal. Say that again."}]);
+    }
+    setLoading(false);
+  };
+
+  const send=()=>{ if(!input.trim()||loading)return; const t=input.trim(); setInput(""); sendMessage(t); };
+
+  // ── SPLASH ─────────────────────────────────────────────────────────────────
+  if(phase==="splash") return (
+    <div style={{minHeight:"100vh",background:"#080810",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",fontFamily:"'Inter',system-ui,sans-serif",color:"#fff",gap:36,padding:32,textAlign:"center"}}>
+      <div>
+        <div style={{fontSize:52,marginBottom:12,filter:"drop-shadow(0 0 30px rgba(124,58,237,0.6))"}}>◈</div>
+        <div style={{fontSize:30,fontWeight:900,letterSpacing:"0.06em",background:"linear-gradient(135deg,#EDE9FE,#A78BFA,#7C3AED)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",marginBottom:6}}>CONDUCTOR</div>
+        <div style={{fontSize:11,color:"rgba(255,255,255,0.25)",letterSpacing:"0.25em"}}>YOUR AI CREATIVE PARTNER</div>
+      </div>
+      <div style={{maxWidth:300,lineHeight:1.9,color:"rgba(255,255,255,0.4)",fontSize:14}}>
+        No knobs. No manuals. No limits.<br/>
+        Just tell me what's in your head —<br/>or pick up your instrument.
+      </div>
+      <button onClick={activate} style={{background:"linear-gradient(135deg,#7C3AED,#5B21B6)",border:"1px solid rgba(167,139,250,0.3)",borderRadius:20,padding:"20px 60px",color:"#fff",fontSize:16,fontWeight:800,cursor:"pointer",letterSpacing:"0.08em",boxShadow:"0 0 60px rgba(124,58,237,0.4)"}}>
+        LET'S CREATE
+      </button>
+      <div style={{fontSize:11,color:"rgba(255,255,255,0.15)"}}>tap to unlock audio · mic access required for recording</div>
+    </div>
+  );
+
+  // ── MAIN ───────────────────────────────────────────────────────────────────
+  return (
+    <div style={{minHeight:"100vh",background:"#080810",color:"#fff",fontFamily:"'Inter',system-ui,sans-serif",display:"flex",flexDirection:"column"}}>
+
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 18px",borderBottom:"1px solid rgba(255,255,255,0.05)",background:"rgba(0,0,0,0.6)",backdropFilter:"blur(16px)",position:"sticky",top:0,zIndex:10}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <div style={{fontSize:20,filter:"drop-shadow(0 0 8px rgba(124,58,237,0.8))"}}>◈</div>
+          <div>
+            <div style={{fontWeight:800,fontSize:14,letterSpacing:"0.08em",background:"linear-gradient(90deg,#EDE9FE,#A78BFA)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>CONDUCTOR</div>
+            <div style={{fontSize:8,color:"rgba(255,255,255,0.2)",letterSpacing:"0.18em",marginTop:1}}>AI CREATIVE PARTNER</div>
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <button onClick={()=>setShowRec(p=>!p)} style={{background:showRec?"rgba(248,113,113,0.2)":"rgba(255,255,255,0.04)",border:`1px solid ${showRec?"rgba(248,113,113,0.4)":"rgba(255,255,255,0.08)"}`,borderRadius:6,padding:"4px 12px",color:showRec?"#F87171":"rgba(255,255,255,0.35)",fontSize:10,cursor:"pointer",letterSpacing:"0.06em"}}>
+            🎙 REC
+          </button>
+          <button onClick={()=>setShowBeat(p=>!p)} style={{background:showBeat?"rgba(124,58,237,0.2)":"rgba(255,255,255,0.04)",border:`1px solid ${showBeat?"rgba(124,58,237,0.4)":"rgba(255,255,255,0.08)"}`,borderRadius:6,padding:"4px 12px",color:showBeat?"#A78BFA":"rgba(255,255,255,0.35)",fontSize:10,cursor:"pointer",letterSpacing:"0.06em"}}>
+            BEAT
+          </button>
+          <div style={{display:"flex",alignItems:"center",gap:5,fontSize:10,color:playing?"#34D399":"#A78BFA"}}>
+            <div style={{width:6,height:6,borderRadius:"50%",background:playing?"#34D399":"#A78BFA",animation:"pulse 2s infinite"}}/>
+            {playing?"PLAYING":"LIVE"}
+          </div>
+        </div>
+      </div>
+
+      {/* Waveform */}
+      <div style={{height:80,background:"rgba(0,0,0,0.4)",borderBottom:"1px solid rgba(255,255,255,0.03)",position:"relative",overflow:"hidden"}}>
+        <Visualizer playing={playing} recording={recording}/>
+        <div style={{position:"absolute",inset:0,pointerEvents:"none",background:"repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,0.06) 3px,rgba(0,0,0,0.06) 4px)"}}/>
+      </div>
+
+      {/* Recording Panel */}
+      {showRec && <RecordingPanel onTrackRecorded={()=>{}} onAnalysisReady={handleAnalysis}/>}
+
+      {/* Beat Grid */}
+      {showBeat && <StepGrid pattern={pattern} activeStep={activeStep} onToggle={toggleStep} bpm={bpm} onBPM={handleBPM} playing={playing} onPlay={startBeat} onStop={stopBeat}/>}
+
+      {/* Sound Chips */}
+      {Object.keys(sounds).length>0&&(
+        <div style={{padding:"8px 16px",display:"flex",gap:8,flexWrap:"wrap",background:"rgba(0,0,0,0.25)",borderBottom:"1px solid rgba(255,255,255,0.03)",alignItems:"center"}}>
+          <span style={{fontSize:8,color:"rgba(255,255,255,0.18)",letterSpacing:"0.14em",marginRight:2}}>HOLD TO PLAY</span>
+          {Object.entries(sounds).map(([id,s])=><Chip key={id} id={id} s={s}/>)}
+        </div>
+      )}
+
+      {/* Chat */}
+      <div ref={chatRef} style={{flex:1,overflowY:"auto",padding:"20px 18px",display:"flex",flexDirection:"column",gap:16}}>
+        {messages.map((m,i)=>(
+          <div key={i} style={{display:"flex",flexDirection:"column",alignItems:m.role==="user"?"flex-end":"flex-start"}}>
+            {m.role==="assistant"&&(
+              <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6,marginLeft:2}}>
+                <div style={{fontSize:12,filter:"drop-shadow(0 0 4px rgba(124,58,237,0.8))"}}>◈</div>
+                <span style={{fontSize:9,color:"#A78BFA",letterSpacing:"0.1em"}}>CO-CO</span>
+              </div>
+            )}
+            <div style={{maxWidth:"82%",background:m.role==="user"?"rgba(124,58,237,0.15)":"rgba(255,255,255,0.04)",border:`1px solid ${m.role==="user"?"rgba(124,58,237,0.25)":"rgba(255,255,255,0.06)"}`,borderRadius:m.role==="user"?"16px 3px 16px 16px":"3px 16px 16px 16px",padding:"12px 16px",fontSize:14,lineHeight:1.75,color:m.role==="user"?"#DDD6FE":"rgba(255,255,255,0.85)",whiteSpace:"pre-line"}}>
+              {m.text}
+            </div>
+          </div>
+        ))}
+        {loading&&(
+          <div style={{display:"flex",alignItems:"center",gap:8,paddingLeft:2}}>
+            <div style={{fontSize:12,filter:"drop-shadow(0 0 4px rgba(124,58,237,0.8))"}}>◈</div>
+            {[0,1,2].map(i=><div key={i} style={{width:4,height:4,borderRadius:"50%",background:"#A78BFA",animation:`bounce 1.2s ${i*0.2}s infinite`}}/>)}
+          </div>
+        )}
+      </div>
+
+      {/* Input */}
+      <div style={{padding:"14px 18px",background:"rgba(0,0,0,0.7)",borderTop:"1px solid rgba(255,255,255,0.05)",backdropFilter:"blur(16px)"}}>
+        <div style={{display:"flex",gap:10,alignItems:"flex-end"}}>
+          <textarea ref={inputRef} value={input} onChange={e=>setInput(e.target.value)}
+            onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}}
+            placeholder="Tell Co-Co what's in your head..."
+            rows={2} style={{flex:1,background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:14,padding:"12px 16px",color:"#fff",fontSize:14,resize:"none",outline:"none",fontFamily:"inherit",lineHeight:1.6,transition:"border-color 0.2s"}}
+            onFocus={e=>e.target.style.borderColor="rgba(124,58,237,0.5)"}
+            onBlur={e=>e.target.style.borderColor="rgba(255,255,255,0.08)"}/>
+          <button onClick={send} disabled={loading||!input.trim()} style={{background:loading||!input.trim()?"rgba(124,58,237,0.15)":"linear-gradient(135deg,#7C3AED,#5B21B6)",border:`1px solid ${loading||!input.trim()?"rgba(124,58,237,0.2)":"rgba(167,139,250,0.3)"}`,borderRadius:14,width:50,height:50,cursor:loading||!input.trim()?"not-allowed":"pointer",color:"#fff",fontSize:18,flexShrink:0,boxShadow:loading||!input.trim()?"none":"0 0 20px rgba(124,58,237,0.3)"}}>
+            {loading?"⟳":"▶"}
+          </button>
+        </div>
+        <div style={{fontSize:10,color:"rgba(255,255,255,0.12)",marginTop:8,textAlign:"center",letterSpacing:"0.05em"}}>
+          🎙 REC to record your instrument · BEAT to open sequencer · Enter to send
+        </div>
+      </div>
+
+      <style>{`
+        @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.4;transform:scale(0.85)}}
+        @keyframes bounce{0%,80%,100%{transform:translateY(0);opacity:0.25}40%{transform:translateY(-6px);opacity:1}}
+        *{box-sizing:border-box}
+        ::-webkit-scrollbar{width:2px}
+        ::-webkit-scrollbar-thumb{background:rgba(124,58,237,0.3);border-radius:2px}
+        textarea::placeholder{color:rgba(255,255,255,0.15)}
+      `}</style>
+    </div>
+  );
+}
