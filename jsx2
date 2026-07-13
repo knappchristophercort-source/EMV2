@@ -1,0 +1,98 @@
+class BeatSequencer {
+  constructor() {
+    this.bpm = 128;
+    this.playing = false;
+    this.step = 0;
+    this.nextTime = 0;
+    this.timer = null;
+    this.onStep = null;
+    
+    this.pattern = {
+      kick: Array(16).fill(0),     // Punchy kick
+      eight08: Array(16).fill(0),  // Fat 808 / sub
+      snare: Array(16).fill(0),
+      closedhat: Array(16).fill(0),
+      openhat: Array(16).fill(0),
+      clap: Array(16).fill(0),
+      perc: Array(16).fill(0)
+    };
+  }
+
+  // Sound generators (expand as needed)
+  kick(t, ctx) { /* your improved kick */ }
+  eight08(t, ctx, slide = false) { /* the fat 808 from previous message */ }
+  snare(t, ctx) { /* ... */ }
+  closedhat(t, ctx) { /* ... */ }
+  openhat(t, ctx) { /* ... */ }
+  clap(t, ctx) { /* ... */ }
+  perc(t, ctx) { /* ... */ }
+
+  schedule() {
+    // Your existing scheduling logic, updated to trigger all 7
+    // (use the while loop from before, calling each if(pattern.xxx[s]))
+  }
+
+  setPattern(p) {
+    Object.keys(this.pattern).forEach(k => {
+      if (p[k]) this.pattern[k] = [...p[k].slice(0,16)];
+    });
+  }
+
+  // Rich genre presets
+  loadGenrePreset(genre = "default") {
+    const g = genre.toLowerCase();
+    let bpm = 128;
+    let pat = {
+      kick: [1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0],
+      eight08: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+      snare: [0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0],
+      closedhat: [1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0],
+      openhat: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+      clap: [0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0],
+      perc: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+    };
+
+    if (g.includes("drum n bass") || g.includes("dnb") || g.includes("jungle")) {
+      bpm = 170;
+      pat.kick = [1,0,0,0,1,0,0,1,0,1,0,0,1,0,0,0];
+      pat.closedhat = Array(16).fill(1); // rolling
+      pat.eight08 = [1,0,0,0,0,0,1,0,0,0,1,0,0,0,1,0];
+    } else if (g.includes("trap") || g.includes("phonk")) {
+      bpm = 140;
+      pat.eight08 = [1,0,0,0,1,0,0,1,0,0,1,0,1,0,0,1];
+      pat.snare = [0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0];
+      pat.clap = [0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0];
+    } else if (g.includes("house") || g.includes("deep house")) {
+      bpm = 124;
+      pat.kick = Array(16).fill(1); // four on the floor
+      pat.clap = [0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0];
+    } else if (g.includes("dubstep") || g.includes("wobble")) {
+      bpm = 140;
+      pat.eight08 = [1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0];
+      pat.perc = [0,1,0,0,0,0,1,0,0,1,0,0,0,0,1,0];
+    } else if (g.includes("hardstyle") || g.includes("hard")) {
+      bpm = 150;
+      pat.kick = [1,0,0,1,0,0,1,0,1,0,0,1,0,0,1,0];
+    } else if (g.includes("trance")) {
+      bpm = 138;
+      pat.kick = Array(16).fill(1);
+      pat.openhat = [0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0];
+    } else if (g.includes("edm") || g.includes("future")) {
+      bpm = 128;
+      pat.eight08 = [1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1];
+    } else if (g.includes("funk") || g.includes("disco")) {
+      bpm = 110;
+      pat.kick = [1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0];
+      pat.clap = [0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0];
+    } else if (g.includes("metal") || g.includes("death")) {
+      bpm = 160;
+      pat.kick = [1,1,0,1,0,1,1,0,1,0,1,1,0,1,0,1];
+      pat.snare = [0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0];
+    } 
+    // Add ska, reggae, rock, etc. as needed
+
+    this.setBPM(bpm);
+    this.setPattern(pat);
+    return { bpm, genre: g };
+  }
+}
