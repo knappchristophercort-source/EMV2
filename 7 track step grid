@@ -1,0 +1,92 @@
+function StepGrid({pattern, activeStep, onToggle, bpm, onBPM, playing, onPlay, onStop}) {
+  const rows = ["kick", "eight08", "snare", "closedhat", "openhat", "clap", "perc"];
+  const colors = {
+    kick: "#F87171",
+    eight08: "#C026D3",   // purple for 808
+    snare: "#FBBF24",
+    closedhat: "#34D399",
+    openhat: "#22D3EE",
+    clap: "#F472B6",
+    perc: "#A78BFA"
+  };
+  const labels = {
+    kick: "KICK",
+    eight08: "808",
+    snare: "SNRE",
+    closedhat: "CHAT",
+    openhat: "OHAT",
+    clap: "CLAP",
+    perc: "PERC"
+  };
+
+  return (
+    <div style={{padding:"10px 16px 12px", background:"rgba(0,0,0,0.3)", borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+      <div style={{display:"flex", alignItems:"center", gap:10, marginBottom:12}}>
+        <button 
+          onClick={playing ? onStop : onPlay} 
+          style={{
+            background: playing ? "rgba(248,113,113,0.15)" : "rgba(124,58,237,0.2)",
+            border: `1px solid ${playing ? "rgba(248,113,113,0.5)" : "rgba(139,92,246,0.4)"}`,
+            borderRadius: 6,
+            padding: "6px 18px",
+            color: playing ? "#F87171" : "#A78BFA",
+            fontSize: 12,
+            fontWeight: 700,
+            letterSpacing: "0.06em",
+            cursor: "pointer"
+          }}
+        >
+          {playing ? "■ STOP" : "▶ PLAY"}
+        </button>
+
+        <div style={{display:"flex", alignItems:"center", gap:8, marginLeft:"auto"}}>
+          <span style={{fontSize:10, color:"rgba(255,255,255,0.4)", letterSpacing:"0.1em"}}>BPM</span>
+          <input 
+            type="range" 
+            min={60} max={180} 
+            value={bpm} 
+            onChange={e => onBPM(Number(e.target.value))} 
+            style={{width:120, accentColor:"#7C3AED"}} 
+          />
+          <span style={{fontSize:13, color:"#A78BFA", fontFamily:"monospace", minWidth:38, textAlign:"right"}}>
+            {bpm}
+          </span>
+        </div>
+      </div>
+
+      {rows.map(row => (
+        <div key={row} style={{display:"flex", alignItems:"center", gap:6, marginBottom:6}}>
+          <span style={{
+            fontSize:9, 
+            color: colors[row], 
+            fontFamily:"monospace", 
+            width:42, 
+            letterSpacing:"0.06em",
+            opacity: 0.9
+          }}>
+            {labels[row]}
+          </span>
+          
+          <div style={{display:"flex", gap:3, flex:1}}>
+            {pattern[row].map((on, i) => (
+              <div 
+                key={i} 
+                onClick={() => onToggle(row, i)}
+                style={{
+                  flex: 1,
+                  height: 26,
+                  borderRadius: 4,
+                  cursor: "pointer",
+                  transition: "all 0.1s",
+                  background: on ? colors[row] : (activeStep === i && playing ? "rgba(255,255,255,0.18)" : "rgba(255,255,255,0.06)"),
+                  border: `1px solid ${on ? colors[row] : (i % 4 === 0 ? "rgba(255,255,255,0.15)" : "rgba(255,255,255,0.05)")}`,
+                  boxShadow: on && activeStep === i ? `0 0 12px ${colors[row]}99` : "none"
+                }}
+              />
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
