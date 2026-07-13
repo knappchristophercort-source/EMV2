@@ -1,0 +1,84 @@
+// ── Step Grid ─────────────────────────────────────────────────────────────────
+function StepGrid({pattern,activeStep,onToggle,bpm,onBPM,playing,onPlay,onStop}) {
+  const rows=["kick","snare","hihat"],colors={kick:"#F87171",snare:"#FBBF24",hihat:"#34D399"},labels={kick:"KICK",snare:"SNRE",hihat:"HHAT"};
+  return (
+    <div style={{padding:"10px 16px 12px",background:"rgba(0,0,0,0.3)",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+        <button onClick={playing?onStop:onPlay} style={{background:playing?"rgba(248,113,113,0.15)":"rgba(124,58,237,0.2)",border:`1px solid ${playing?"rgba(248,113,113,0.5)":"rgba(139,92,246,0.4)"}`,borderRadius:6,padding:"4px 14px",color:playing?"#F87171":"#A78BFA",fontSize:11,cursor:"pointer",fontWeight:700,letterSpacing:"0.06em"}}>
+          {playing?"■ STOP":"▶ PLAY"}
+        </button>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginLeft:"auto"}}>
+          <span style={{fontSize:9,color:"rgba(255,255,255,0.25)",letterSpacing:"0.1em"}}>BPM</span>
+          <input type="range" min={60} max={180} value={bpm} onChange={e=>onBPM(Number(e.target.value))} style={{width:72,accentColor:"#7C3AED"}}/>
+          <span style={{fontSize:12,color:"#A78BFA",fontFamily:"monospace",minWidth:30,textAlign:"right"}}>{bpm}</span>
+        </div>
+      </div>
+      {rows.map(row=>(
+        <div key={row} style={{display:"flex",alignItems:"center",gap:5,marginBottom:4}}>
+          <span style={{fontSize:8,color:colors[row],fontFamily:"monospace",width:30,letterSpacing:"0.06em",opacity:0.8}}>{labels[row]}</span>
+          <div style={{display:"flex",gap:2,flex:1}}>
+            {pattern[row].map((on,i)=>(
+              <div key={i} onClick={()=>onToggle(row,i)} style={{flex:1,height:20,borderRadius:3,cursor:"pointer",transition:"all 0.08s",background:on?colors[row]:(activeStep===i&&playing?"rgba(255,255,255,0.12)":"rgba(255,255,255,0.05)"),border:`1px solid ${on?colors[row]:(i%4===0?"rgba(255,255,255,0.1)":"rgba(255,255,255,0.03)")}`,boxShadow:on&&activeStep===i?`0 0 10px ${colors[row]}88`:"none"}}/>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Sound Chip ────────────────────────────────────────────────────────────────
+function Chip({id,s}) {
+  const [on,setOn]=useState(false);
+  const press=()=>{setOn(true);holdNote(id,{freq:noteToFreq(s.note),type:s.type,attack:s.attack,vol:0.32,reverb:s.reverb,delay:s.delay,distortion:s.distortion});};
+  const lift=()=>{setOn(false);releaseNote(id);};
+  return (
+    <div onMouseDown={press} onMouseUp={lift} onMouseLeave={()=>on&&lift()}
+      onTouchStart={e=>{e.preventDefault();press();}} onTouchEnd={e=>{e.preventDefault();lift();}}
+      style={{background:on?"rgba(124,58,237,0.3)":"rgba(255,255,255,0.04)",border:`1px solid ${on?"#7C3AED":"rgba(255,255,255,0.08)"}`,borderRadius:10,padding:"8px 14px",cursor:"pointer",userSelect:"none",transition:"all 0.1s",boxShadow:on?"0 0 20px rgba(124,58,237,0.4)":"none"}}>
+      <div style={{fontSize:9,color:"#A78BFA",fontFamily:"monospace",marginBottom:3,letterSpacing:"0.06em"}}>{id.toUpperCase()}</div>
+      <div style={{fontSize:14,fontWeight:700,color:"#fff"}}>{s.note}</div>
+      <div style={{fontSize:8,color:"rgba(255,255,255,0.25)",fontFamily:"monospace",marginTop:2}}>{s.type}{s.reverb>0?" · rv":""}{s.delay>0?" · dl":""}{s.distortion>0?" · fx":""}</div>
+    </div>
+  );
+}
+
+// ── Recorded Track Chip ───────────────────────────────────────────────────────
+function TrackChip({track, onPlay, onDelete}) {
+  const [playing, setPlaying] = useState(false);
+  const sourceRef = useRef(null);
+
+  const play = async () => {
+    if (playing) {
+      if (sourceRef.current) { try { sourceRef.current.stop(); } catch {} }
+      setPlaying(false); return;
+    }
+    const ctx = await resumeCtx();
+    const source = ctx.createBufferSource();
+    source.buffer = track.buffer;
+    source.connect(ctx.destination);
+    source.start();
+    sourceRef.current = source;
+    setPlaying(true);
+    source.onended = () => setPlaying(false);
+  };
+
+  return (
+    <div style={{background:"rgba(248,113,113,0.08)",border:"1px solid rgba(248,113,113,0.2)",borderRadius:10,padding:"8px 12px",display:"flex",alignItems:"center",gap:10}}>
+      <div style={{flex:1}}>
+        <div style={{fontSize:9,color:"#F87171",fontFamily:"monospace",marginBottom:2,letterSpacing:"0.06em"}}>{track.name}</div>
+        <div style={{fontSize:10,color:"rgba(255,255,255,0.5)"}}>
+          {track.duration.toFixed(1)}s
+          {track.dominantNote && <span style={{marginLeft:8,color:"#FBBF24"}}>~{track.dominantNote}</span>}
+        </div>
+      </div>
+      <button onClick={play} style={{background:playing?"rgba(248,113,113,0.3)":"rgba(255,255,255,0.06)",border:`1px solid ${playing?"#F87171":"rgba(255,255,255,0.1)"}`,borderRadius:6,padding:"4px 10px",color:playing?"#F87171":"rgba(255,255,255,0.6)",fontSize:11,cursor:"pointer"}}>
+        {playing?"■":"▶"}
+      </button>
+      <button onClick={onDelete} style={{background:"transparent",border:"none",color:"rgba(255,255,255,0.2)",fontSize:14,cursor:"pointer",padding:"0 2px"}}>×</button>
+    </div>
+  );
+}
+
+// ── Recording Panel ───────────────────────────────────────────────────────────
+function RecordingPanel({onTrackRecorded,
