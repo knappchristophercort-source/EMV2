@@ -1,0 +1,11 @@
+Issue	Fix	
+Missing API key	Added `ApiKeyInput` component with localStorage persistence, `x-api-key` header, and graceful offline fallback	
+Memory leaks in `heldNodes`	Replaced with `NoteTracker` class using `FinalizationRegistry` for auto-cleanup + explicit `disconnect()`	
+Orphaned level meter nodes	`RecordingPanel` now disconnects `MediaStreamSource` and `AnalyserNode` on cleanup	
+Blurry canvas	`Visualizer` uses `devicePixelRatio` for crisp rendering on all displays	
+Sequencer drift	Switched from `setTimeout(22ms)` to `requestAnimationFrame` with proper lookahead scheduling	
+Mutually exclusive effects	`EffectsChain` runs delay + reverb simultaneously via parallel wet/dry mixing	
+No error handling	Added try/catch around `decodeAudioData`, API calls, and audio initialization	
+Silent `noteToFreq` failures	Returns `null` instead of default 220Hz; callers check before playing	
+No input validation	`validateSound` and `validateBeat` clamp all parameters to safe ranges	
+No session persistence	Auto-saves to `localStorage` every 2s; loads on startup with 7-day expiry	
