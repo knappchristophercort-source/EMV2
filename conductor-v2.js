@@ -1,0 +1,1650 @@
+
+/* CONDUCTOR v2 — Pure JavaScript (No Babel/JSX required) */
+/* Transpiled from React JSX to vanilla JS with React.createElement */
+
+(function() {
+"use strict";
+
+var React = window.React;
+var useState = React.useState;
+var useRef = React.useRef;
+var useEffect = React.useEffect;
+var useCallback = React.useCallback;
+var useMemo = React.useMemo;
+var createElement = React.createElement;
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+var NOTE_MAP = { C: 0, "C#": 1, Db: 1, D: 2, "D#": 3, Eb: 3, E: 4, F: 5, "F#": 6, Gb: 6, G: 7, "G#": 8, Ab: 8, A: 9, "A#": 10, Bb: 10, B: 11 };
+var NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+var MIN_FREQ = 27.5;
+var MAX_FREQ = 4186.0;
+var FFT_SIZE = 4096;
+var HOP_SIZE = 2048;
+var RMS_THRESHOLD = 0.001;
+var SEQUENCER_STEPS = 16;
+var LOOKAHEAD_S = 0.1;
+var API_KEY_STORAGE_KEY = "conductor_api_key";
+var SESSION_KEY = "conductor_session_v2";
+
+// ============================================================
+// AUDIO CONTEXT MANAGER
+// ============================================================
+function AudioContextManager() {
+  this.ctx = null;
+  this.state = "suspended";
+  this._resumePromise = null;
+  this._listeners = new Set();
+}
+
+AudioContextManager.prototype.get = function() {
+  if (!this.ctx || this.ctx.state === "closed") {
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) throw new Error("Web Audio API not supported");
+    this.ctx = new Ctx({ latencyHint: "interactive", sampleRate: 48000 });
+    var self = this;
+    this.ctx.addEventListener("statechange", function() {
+      self.state = self.ctx.state;
+      self._listeners.forEach(function(fn) { fn(self.ctx.state); });
+    });
+    this.state = this.ctx.state;
+  }
+  return this.ctx;
+};
+
+AudioContextManager.prototype.resume = function() {
+  var c = this.get();
+  if (c.state === "running") return Promise.resolve(c);
+  if (this._resumePromise) return this._resumePromise;
+  var self = this;
+  this._resumePromise = c.resume().then(function() { return c; }).finally(function() { self._resumePromise = null; });
+  return this._resumePromise;
+};
+
+AudioContextManager.prototype.onStateChange = function(fn) {
+  this._listeners.add(fn);
+  return function() { this._listeners.delete(fn); }.bind(this);
+};
+
+Object.defineProperty(AudioContextManager.prototype, "currentTime", {
+  get: function() { return this.get().currentTime; }
+});
+
+Object.defineProperty(AudioContextManager.prototype, "sampleRate", {
+  get: function() { return this.get().sampleRate; }
+});
+
+var audioManager = new AudioContextManager();
+
+// ============================================================
+// MASTER BUS
+// ============================================================
+var masterBus = null;
+
+function getMasterBus() {
+  if (!masterBus) {
+    var ctx = audioManager.get();
+    var bus = {
+      input: ctx.createGain(),
+      compressor: ctx.createDynamicsCompressor(),
+      limiter: ctx.createDynamicsCompressor()
+    };
+    bus.input.gain.value = 0.85;
+    bus.compressor.threshold.value = -18;
+    bus.compressor.knee.value = 6;
+    bus.compressor.ratio.value = 4;
+    bus.compressor.attack.value = 0.003;
+    bus.compressor.release.value = 0.15;
+    bus.limiter.threshold.value = -3;
+    bus.limiter.knee.value = 0;
+    bus.limiter.ratio.value = 20;
+    bus.limiter.attack.value = 0.001;
+    bus.limiter.release.value = 0.05;
+    bus.input.connect(bus.compressor);
+    bus.compressor.connect(bus.limiter);
+    bus.limiter.connect(ctx.destination);
+    bus.setVolume = function(db) {
+      var linear = Math.pow(10, db / 20);
+      bus.input.gain.setTargetAtTime(Math.min(linear, 1.2), audioManager.currentTime, 0.02);
+    };
+    bus.getInputNode = function() { return bus.input; };
+    masterBus = bus;
+  }
+  return masterBus;
+}
+
+// ============================================================
+// UTILITIES
+// ============================================================
+function noteToFreq(note) {
+  var m = note.match(/^([A-G](?:#|b)?)(-?\d+)$/);
+  if (!m) { console.warn("Invalid note: " + note); return null; }
+  var semitone = NOTE_MAP[m[1]];
+  if (semitone === undefined) return null;
+  var octave = parseInt(m[2], 10);
+  var midi = semitone + (octave + 1) * 12;
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+function freqToNote(freq) {
+  if (!freq || freq < MIN_FREQ || freq > MAX_FREQ) return null;
+  var midi = Math.round(12 * Math.log2(freq / 440) + 69);
+  return NOTE_NAMES[midi % 12] + (Math.floor(midi / 12) - 1);
+}
+
+function makeDistortionCurve(amount, samples) {
+  samples = samples || 256;
+  var curve = new Float32Array(samples);
+  var k = amount * 300;
+  var denom = Math.PI + k;
+  for (var i = 0; i < samples; i++) {
+    var x = (i * 2) / samples - 1;
+    curve[i] = (denom * x) / (Math.PI + k * Math.abs(x));
+  }
+  return curve;
+}
+
+function createReverbBuffer(ctx, duration, decay, preDelay) {
+  preDelay = preDelay || 0.01;
+  var sampleRate = ctx.sampleRate;
+  var length = Math.floor(sampleRate * (duration + preDelay));
+  var buffer = ctx.createBuffer(2, length, sampleRate);
+  for (var ch = 0; ch < 2; ch++) {
+    var data = buffer.getChannelData(ch);
+    for (var i = 0; i < length; i++) {
+      var t = i / sampleRate;
+      if (t < preDelay) { data[i] = 0; continue; }
+      var rel = (t - preDelay) / duration;
+      var env = Math.pow(1 - rel, 1 + decay * 2);
+      data[i] = (Math.random() * 2 - 1) * env;
+    }
+  }
+  return buffer;
+}
+
+function clampNum(v, min, max, def) {
+  var n = Number(v);
+  if (isNaN(n)) return def;
+  return Math.max(min, Math.min(max, n));
+}
+
+// ============================================================
+// EFFECTS CHAIN
+// ============================================================
+function EffectsChain(ctx, options) {
+  this.ctx = ctx;
+  this.nodes = [];
+  this.input = ctx.createGain();
+  this.output = ctx.createGain();
+  this.wetGain = ctx.createGain();
+  this.dryGain = ctx.createGain();
+
+  this.input.connect(this.dryGain);
+  this.dryGain.connect(this.output);
+
+  var last = this.input;
+
+  if (options.distortion > 0) {
+    var dist = ctx.createWaveShaper();
+    dist.curve = makeDistortionCurve(options.distortion);
+    dist.oversample = "4x";
+    this.input.disconnect();
+    this.input.connect(dist);
+    last = dist;
+    this.nodes.push(dist);
+  }
+
+  last.connect(this.dryGain);
+
+  if (options.delay > 0) {
+    var delayNode = ctx.createDelay(2.0);
+    var feedback = ctx.createGain();
+    var delayWet = ctx.createGain();
+    delayNode.delayTime.value = 0.28 * options.delay;
+    feedback.gain.value = options.delay * 0.42;
+    delayWet.gain.value = 0.5;
+    last.connect(delayNode);
+    delayNode.connect(feedback);
+    feedback.connect(delayNode);
+    delayNode.connect(delayWet);
+    delayWet.connect(this.wetGain);
+    this.nodes.push(delayNode, feedback, delayWet);
+  }
+
+  if (options.reverb > 0) {
+    var convolver = ctx.createConvolver();
+    var reverbWet = ctx.createGain();
+    var reverbDuration = 0.4 + options.reverb * 3;
+    convolver.buffer = createReverbBuffer(ctx, reverbDuration, options.reverb);
+    reverbWet.gain.value = options.reverb * 0.65;
+    last.connect(convolver);
+    convolver.connect(reverbWet);
+    reverbWet.connect(this.wetGain);
+    this.nodes.push(convolver, reverbWet);
+  }
+
+  this.wetGain.connect(this.output);
+  this.dryGain.gain.value = 1 - (options.reverb * 0.35 + options.delay * 0.2);
+  this.wetGain.gain.value = Math.max(options.reverb * 0.5, options.delay * 0.3);
+  this.output.connect(getMasterBus().getInputNode());
+}
+
+EffectsChain.prototype.dispose = function() {
+  try {
+    this.input.disconnect();
+    this.output.disconnect();
+    this.wetGain.disconnect();
+    this.dryGain.disconnect();
+    for (var i = 0; i < this.nodes.length; i++) {
+      try { this.nodes[i].disconnect(); } catch(e) {}
+    }
+  } catch(e) {}
+};
+
+// ============================================================
+// VOICE
+// ============================================================
+function Voice(ctx, params) {
+  this.ctx = ctx;
+  this.id = params.id || "voice_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
+  this.params = params;
+  this.active = true;
+  this._disposed = false;
+
+  var now = ctx.currentTime;
+  var freq = params.freq;
+  var type = params.type || "sine";
+  var attack = params.attack || 0.05;
+  var release = params.release || 1.2;
+  var vol = params.vol || 0.35;
+  var reverb = params.reverb || 0;
+  var delay = params.delay || 0;
+  var distortion = params.distortion || 0;
+
+  this.osc = ctx.createOscillator();
+  this.osc.type = type;
+  this.osc.frequency.value = freq;
+
+  this.env = ctx.createGain();
+  this.env.gain.setValueAtTime(0, now);
+  this.env.gain.linearRampToValueAtTime(vol, now + attack);
+  this.env.gain.setValueAtTime(vol, now + attack + 0.2);
+
+  this.osc.connect(this.env);
+  this.effects = new EffectsChain(ctx, { reverb: reverb, delay: delay, distortion: distortion });
+  this.env.connect(this.effects.input);
+
+  this.osc.start(now);
+  this.stopTime = now + attack + 0.2 + release + 0.1;
+  this.osc.stop(this.stopTime);
+
+  var self = this;
+  this.osc.onended = function() { self.dispose(); };
+}
+
+Voice.prototype.release = function() {
+  if (!this.active) return;
+  this.active = false;
+  var now = this.ctx.currentTime;
+  var release = this.params.release || 0.6;
+  this.env.gain.cancelScheduledValues(now);
+  this.env.gain.setValueAtTime(this.env.gain.value, now);
+  this.env.gain.exponentialRampToValueAtTime(0.0001, now + release);
+  this.osc.stop(now + release + 0.05);
+};
+
+Voice.prototype.dispose = function() {
+  if (this._disposed) return;
+  this._disposed = true;
+  this.active = false;
+  try {
+    this.effects.dispose();
+    try { this.osc.disconnect(); } catch(e) {}
+    try { this.env.disconnect(); } catch(e) {}
+  } catch(e) {}
+};
+
+// ============================================================
+// NOTE TRACKER
+// ============================================================
+function NoteTracker() {
+  this._voices = new Map();
+}
+
+NoteTracker.prototype.hold = function(id, params) {
+  this.release(id);
+  var voice = new Voice(audioManager.get(), Object.assign({}, params, { id: id }));
+  this._voices.set(id, voice);
+  return voice;
+};
+
+NoteTracker.prototype.release = function(id) {
+  var voice = this._voices.get(id);
+  if (voice) {
+    voice.release();
+    this._voices.delete(id);
+  }
+};
+
+NoteTracker.prototype.releaseAll = function() {
+  this._voices.forEach(function(v) { v.release(); });
+  this._voices.clear();
+};
+
+Object.defineProperty(NoteTracker.prototype, "activeCount", {
+  get: function() { return this._voices.size; }
+});
+
+var noteTracker = new NoteTracker();
+
+function playNote(params) {
+  return audioManager.resume().then(function(ctx) {
+    return new Voice(ctx, params);
+  });
+}
+
+function holdNote(id, params) {
+  return audioManager.resume().then(function() {
+    return noteTracker.hold(id, params);
+  });
+}
+
+function releaseNote(id) {
+  noteTracker.release(id);
+}
+
+function releaseAllNotes() {
+  noteTracker.releaseAll();
+}
+
+// ============================================================
+// DRUM SYNTHESIZER
+// ============================================================
+function DrumSynthesizer(ctx) {
+  this.ctx = ctx;
+}
+
+DrumSynthesizer.prototype.kick = function(time, vol) {
+  vol = vol || 0.85;
+  var ctx = this.ctx;
+  var o = ctx.createOscillator();
+  var g = ctx.createGain();
+  o.type = "sine";
+  o.frequency.setValueAtTime(160, time);
+  o.frequency.exponentialRampToValueAtTime(40, time + 0.09);
+  g.gain.setValueAtTime(vol, time);
+  g.gain.exponentialRampToValueAtTime(0.001, time + 0.28);
+  o.connect(g);
+  g.connect(getMasterBus().getInputNode());
+  o.start(time);
+  o.stop(time + 0.32);
+};
+
+DrumSynthesizer.prototype.snare = function(time, vol) {
+  vol = vol || 0.55;
+  var ctx = this.ctx;
+  var len = Math.floor(ctx.sampleRate * 0.18);
+  var buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  var d = buf.getChannelData(0);
+  for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  var n = ctx.createBufferSource();
+  var f = ctx.createBiquadFilter();
+  var g = ctx.createGain();
+  n.buffer = buf;
+  f.type = "bandpass";
+  f.frequency.value = 1900;
+  g.gain.setValueAtTime(vol, time);
+  g.gain.exponentialRampToValueAtTime(0.001, time + 0.18);
+  n.connect(f);
+  f.connect(g);
+  g.connect(getMasterBus().getInputNode());
+  n.start(time);
+  n.stop(time + 0.22);
+
+  var o = ctx.createOscillator();
+  var g2 = ctx.createGain();
+  o.type = "triangle";
+  o.frequency.value = 195;
+  g2.gain.setValueAtTime(vol * 0.5, time);
+  g2.gain.exponentialRampToValueAtTime(0.001, time + 0.1);
+  o.connect(g2);
+  g2.connect(getMasterBus().getInputNode());
+  o.start(time);
+  o.stop(time + 0.12);
+};
+
+DrumSynthesizer.prototype.hihat = function(time, open, vol) {
+  vol = vol || 0.14;
+  var ctx = this.ctx;
+  var dur = open ? 0.28 : 0.045;
+  var len = Math.floor(ctx.sampleRate * dur);
+  var buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  var d = buf.getChannelData(0);
+  for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  var n = ctx.createBufferSource();
+  var f = ctx.createBiquadFilter();
+  var g = ctx.createGain();
+  n.buffer = buf;
+  f.type = "highpass";
+  f.frequency.value = 8000;
+  g.gain.setValueAtTime(open ? vol * 1.3 : vol, time);
+  g.gain.exponentialRampToValueAtTime(0.001, time + dur);
+  n.connect(f);
+  f.connect(g);
+  g.connect(getMasterBus().getInputNode());
+  n.start(time);
+  n.stop(time + dur + 0.02);
+};
+
+// ============================================================
+// PITCH DETECTION
+// ============================================================
+function detectPitch(buffer, sampleRate) {
+  var SIZE = Math.min(FFT_SIZE, buffer.length);
+  var start = Math.max(0, Math.floor(buffer.length / 2) - SIZE / 2);
+  var buf = Array.prototype.slice.call(buffer, start, start + SIZE);
+
+  var rms = 0;
+  for (var i = 0; i < SIZE; i++) rms += buf[i] * buf[i];
+  rms = Math.sqrt(rms / SIZE);
+  if (rms < RMS_THRESHOLD) return { freq: null, rms: rms, confidence: 0 };
+
+  var MAX = Math.floor(SIZE / 2);
+  var bestOffset = -1, bestCorr = 0;
+  var corr = new Float32Array(MAX);
+
+  for (var offset = 1; offset < MAX; offset++) {
+    var c = 0;
+    for (var j = 0; j < MAX; j++) c += buf[j] * buf[j + offset];
+    c /= MAX;
+    corr[offset] = c;
+    if (c > bestCorr) { bestCorr = c; bestOffset = offset; }
+  }
+
+  if (bestOffset < 2 || bestOffset >= MAX - 1) {
+    return { freq: null, rms: rms, confidence: bestCorr };
+  }
+
+  var alpha = corr[bestOffset - 1];
+  var beta = corr[bestOffset];
+  var gamma = corr[bestOffset + 1];
+  var p = 0.5 * (alpha - gamma) / (alpha - 2 * beta + gamma);
+  var refinedOffset = bestOffset + p;
+  var freq = sampleRate / refinedOffset;
+
+  if (freq < MIN_FREQ || freq > MAX_FREQ) {
+    return { freq: null, rms: rms, confidence: bestCorr };
+  }
+
+  return { freq: freq, rms: rms, confidence: bestCorr };
+}
+
+function analyzePitch(audioBuffer) {
+  var sr = audioBuffer.sampleRate;
+  var data = audioBuffer.getChannelData(0);
+  var results = [];
+
+  for (var i = 0; i + FFT_SIZE < data.length; i += HOP_SIZE) {
+    var window = Array.prototype.slice.call(data, i, i + FFT_SIZE);
+    var r = detectPitch(window, sr);
+    if (r.freq && r.rms > RMS_THRESHOLD) results.push(r);
+  }
+
+  if (!results.length) return { freq: null, note: null, rms: 0, confidence: 0 };
+
+  results.sort(function(a, b) { return b.confidence - a.confidence; });
+  var best = results[0];
+  return { freq: best.freq, note: freqToNote(best.freq), rms: best.rms, confidence: best.confidence };
+}
+
+// ============================================================
+// BEAT SEQUENCER
+// ============================================================
+function BeatSequencer() {
+  this.bpm = 90;
+  this.playing = false;
+  this.step = 0;
+  this.nextTime = 0;
+  this._rafId = null;
+  this.onStep = null;
+  this.pattern = { kick: Array(SEQUENCER_STEPS).fill(0), snare: Array(SEQUENCER_STEPS).fill(0), hihat: Array(SEQUENCER_STEPS).fill(0) };
+  this._drums = null;
+}
+
+BeatSequencer.prototype._ensureDrums = function() {
+  if (!this._drums) this._drums = new DrumSynthesizer(audioManager.get());
+  return this._drums;
+};
+
+BeatSequencer.prototype._schedule = function() {
+  if (!this.playing) return;
+  var ctx = audioManager.get();
+  var sps = (60 / this.bpm) / 4;
+
+  while (this.nextTime < ctx.currentTime + LOOKAHEAD_S) {
+    var s = this.step;
+    var t = this.nextTime;
+    var drums = this._ensureDrums();
+
+    if (this.pattern.kick[s]) drums.kick(t);
+    if (this.pattern.snare[s]) drums.snare(t);
+    if (this.pattern.hihat[s]) drums.hihat(t, s % 8 === 0);
+
+    if (this.onStep) {
+      (function(step) {
+        var delayMs = Math.max(0, (t - ctx.currentTime) * 1000);
+        setTimeout(function() { if (this.playing) this.onStep(step); }.bind(this), delayMs);
+      }).call(this, s);
+    }
+
+    this.step = (s + 1) % SEQUENCER_STEPS;
+    this.nextTime += sps;
+  }
+
+  this._rafId = requestAnimationFrame(this._schedule.bind(this));
+};
+
+BeatSequencer.prototype.start = function() {
+  if (this.playing) return Promise.resolve();
+  var self = this;
+  return audioManager.resume().then(function(ctx) {
+    self.playing = true;
+    self.step = 0;
+    self.nextTime = ctx.currentTime + 0.05;
+    self._schedule();
+  });
+};
+
+BeatSequencer.prototype.stop = function() {
+  this.playing = false;
+  if (this._rafId) {
+    cancelAnimationFrame(this._rafId);
+    this._rafId = null;
+  }
+};
+
+BeatSequencer.prototype.setPattern = function(p) {
+  this.pattern = {
+    kick: (p.kick || []).slice(0, SEQUENCER_STEPS),
+    snare: (p.snare || []).slice(0, SEQUENCER_STEPS),
+    hihat: (p.hihat || []).slice(0, SEQUENCER_STEPS)
+  };
+  while (this.pattern.kick.length < SEQUENCER_STEPS) this.pattern.kick.push(0);
+  while (this.pattern.snare.length < SEQUENCER_STEPS) this.pattern.snare.push(0);
+  while (this.pattern.hihat.length < SEQUENCER_STEPS) this.pattern.hihat.push(0);
+};
+
+BeatSequencer.prototype.setBPM = function(b) {
+  this.bpm = Math.max(60, Math.min(180, b));
+};
+
+var sequencer = new BeatSequencer();
+
+// ============================================================
+// SESSION STORAGE
+// ============================================================
+function getStoredApiKey() {
+  try { return localStorage.getItem(API_KEY_STORAGE_KEY); } catch(e) { return null; }
+}
+
+function setStoredApiKey(key) {
+  try { localStorage.setItem(API_KEY_STORAGE_KEY, key); } catch(e) {}
+}
+
+function clearStoredApiKey() {
+  try { localStorage.removeItem(API_KEY_STORAGE_KEY); } catch(e) {}
+}
+
+function saveSession(state) {
+  try {
+    var data = {
+      sounds: state.sounds,
+      pattern: state.pattern,
+      bpm: state.bpm,
+      messages: state.messages.slice(-20),
+      timestamp: Date.now()
+    };
+    localStorage.setItem(SESSION_KEY, JSON.stringify(data));
+  } catch(e) {}
+}
+
+function loadSession() {
+  try {
+    var raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    var data = JSON.parse(raw);
+    if (Date.now() - data.timestamp > 7 * 24 * 60 * 60 * 1000) {
+      localStorage.removeItem(SESSION_KEY);
+      return null;
+    }
+    return data;
+  } catch(e) { return null; }
+}
+
+// ============================================================
+// VALIDATION
+// ============================================================
+function validateSound(s) {
+  if (!s || typeof s !== "object") return null;
+  var out = {};
+  if (typeof s.name === "string") out.name = s.name;
+  if (typeof s.note === "string") out.note = s.note;
+  if (["sine", "triangle", "sawtooth", "square"].indexOf(s.type) !== -1) out.type = s.type;
+  else out.type = "sine";
+  out.attack = clampNum(s.attack, 0.01, 2.0, 0.05);
+  out.release = clampNum(s.release, 0.2, 6.0, 1.2);
+  out.reverb = clampNum(s.reverb, 0, 1, 0);
+  out.delay = clampNum(s.delay, 0, 1, 0);
+  out.distortion = clampNum(s.distortion, 0, 1, 0);
+  out.volume = clampNum(s.volume, -20, -4, -8);
+  return out;
+}
+
+function validateStepArray(arr) {
+  if (!Array.isArray(arr)) return Array(SEQUENCER_STEPS).fill(0);
+  return arr.slice(0, SEQUENCER_STEPS).map(function(v) { return v ? 1 : 0; });
+}
+
+function validateBeat(b) {
+  if (!b || typeof b !== "object") return null;
+  return {
+    bpm: clampNum(b.bpm, 60, 180, 90),
+    kick: validateStepArray(b.kick),
+    snare: validateStepArray(b.snare),
+    hihat: validateStepArray(b.hihat)
+  };
+}
+
+// ============================================================
+// OFFLINE PRESETS
+// ============================================================
+var OFFLINE_PRESETS = {
+  ambient: {
+    sounds: [
+      { name: "pad", note: "C3", type: "sine", attack: 1.2, release: 3.5, reverb: 0.6, delay: 0.3, distortion: 0, volume: -12 },
+      { name: "bass", note: "C2", type: "triangle", attack: 0.3, release: 2.0, reverb: 0.4, delay: 0, distortion: 0, volume: -10 }
+    ],
+    play: ["pad", "bass"],
+    beat: { bpm: 80, kick: [1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0], snare: [0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0], hihat: [1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0] }
+  },
+  driving: {
+    sounds: [
+      { name: "bass", note: "E2", type: "sawtooth", attack: 0.02, release: 1.5, reverb: 0.1, delay: 0.2, distortion: 0.3, volume: -8 },
+      { name: "lead", note: "E4", type: "square", attack: 0.05, release: 0.8, reverb: 0.3, delay: 0.4, distortion: 0.1, volume: -10 }
+    ],
+    play: ["bass", "lead"],
+    beat: { bpm: 120, kick: [1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0], snare: [0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0], hihat: [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1] }
+  },
+  chill: {
+    sounds: [
+      { name: "pluck", note: "A3", type: "triangle", attack: 0.01, release: 1.0, reverb: 0.5, delay: 0.2, distortion: 0, volume: -10 },
+      { name: "sub", note: "A1", type: "sine", attack: 0.2, release: 2.5, reverb: 0.2, delay: 0, distortion: 0, volume: -12 }
+    ],
+    play: ["pluck", "sub"],
+    beat: { bpm: 85, kick: [1,0,0,0,0,0,1,0,0,0,1,0,0,0,0,0], snare: [0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0], hihat: [1,0,1,1,1,0,1,0,1,0,1,1,1,0,1,0] }
+  }
+};
+
+// ============================================================
+// SYSTEM PROMPT
+// ============================================================
+var SYSTEM_PROMPT = "You are Co-Co (short for Co-Conductor) — a world-class music producer and creative partner...";
+
+var EMPTY_PATTERN = {
+  kick: Array(SEQUENCER_STEPS).fill(0),
+  snare: Array(SEQUENCER_STEPS).fill(0),
+  hihat: Array(SEQUENCER_STEPS).fill(0)
+};
+
+// ============================================================
+// UI COMPONENTS (Pure JS, no JSX)
+// ============================================================
+
+function Visualizer(props) {
+  var canvasRef = useRef(null);
+  var rafRef = useRef(null);
+  var timeRef = useRef(0);
+
+  useEffect(function() {
+    var canvas = canvasRef.current;
+    if (!canvas) return;
+    var ctx = canvas.getContext("2d");
+
+    function resize() {
+      var dpr = window.devicePixelRatio || 1;
+      var rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.scale(dpr, dpr);
+    }
+    resize();
+    window.addEventListener("resize", resize);
+
+    function draw() {
+      rafRef.current = requestAnimationFrame(draw);
+      timeRef.current += 0.018;
+      var t = timeRef.current;
+      var dpr = window.devicePixelRatio || 1;
+      var W = canvas.width / dpr;
+      var H = canvas.height / dpr;
+
+      ctx.clearRect(0, 0, W, H);
+      ctx.strokeStyle = "rgba(255,255,255,0.03)";
+      ctx.lineWidth = 1;
+      [H * 0.25, H * 0.5, H * 0.75].forEach(function(y) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
+        ctx.stroke();
+      });
+
+      var hasNotes = props.activeNotes > 0;
+      var amp = props.recording ? 35 : props.playing ? 28 : hasNotes ? 20 : 3;
+      var spd = props.recording ? 2.2 : props.playing ? 1.8 : 1;
+      var color = props.recording ? "#F87171" : "#A78BFA";
+      var r = props.recording ? "248,113,113" : "124,58,237";
+
+      ctx.lineWidth = 1.5;
+      ctx.shadowBlur = props.recording ? 28 : props.playing ? 20 : 5;
+      ctx.shadowColor = color;
+
+      var grad = ctx.createLinearGradient(0, 0, W, 0);
+      grad.addColorStop(0, "rgba(" + r + ",0.05)");
+      grad.addColorStop(0.5, color);
+      grad.addColorStop(1, "rgba(" + r + ",0.05)");
+      ctx.strokeStyle = grad;
+
+      ctx.beginPath();
+      for (var x = 0; x < W; x++) {
+        var y = H / 2 + Math.sin(x * 0.016 + t * spd) * amp + Math.sin(x * 0.041 + t * spd * 1.4) * (amp * 0.35) + Math.sin(x * 0.008 + t * spd * 0.6) * (amp * 0.2);
+        if (x === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
+
+    draw();
+    return function() {
+      cancelAnimationFrame(rafRef.current);
+      window.removeEventListener("resize", resize);
+    };
+  }, [props.playing, props.recording, props.activeNotes]);
+
+  return createElement("canvas", {
+    ref: canvasRef,
+    style: { width: "100%", height: "100%", display: "block" }
+  });
+}
+
+function StepGrid(props) {
+  var rows = ["kick", "snare", "hihat"];
+  var colors = { kick: "#F87171", snare: "#FBBF24", hihat: "#34D399" };
+  var labels = { kick: "KICK", snare: "SNRE", hihat: "HHAT" };
+
+  return createElement("div", { className: "step-grid" },
+    createElement("div", { className: "step-grid-header" },
+      createElement("button", {
+        onClick: props.playing ? props.onStop : props.onPlay,
+        className: "seq-btn " + (props.playing ? "stop" : "play")
+      }, props.playing ? "■ STOP" : "▶ PLAY"),
+      createElement("div", { className: "bpm-control" },
+        createElement("span", { className: "bpm-label" }, "BPM"),
+        createElement("input", {
+          type: "range", min: 60, max: 180, value: props.bpm,
+          onChange: function(e) { props.onBPM(Number(e.target.value)); },
+          className: "bpm-slider"
+        }),
+        createElement("span", { className: "bpm-value" }, props.bpm)
+      )
+    ),
+    rows.map(function(row) {
+      return createElement("div", { key: row, className: "step-row" },
+        createElement("span", { className: "step-label", style: { color: colors[row] } }, labels[row]),
+        createElement("div", { className: "step-cells" },
+          props.pattern[row].map(function(on, i) {
+            var isPlaying = props.activeStep === i && props.playing;
+            return createElement("div", {
+              key: i,
+              onClick: function() { props.onToggle(row, i); },
+              className: "step-cell",
+              style: {
+                background: on ? colors[row] : isPlaying ? "rgba(255,255,255,0.12)" : "rgba(255,255,255,0.05)",
+                borderColor: on ? colors[row] : i % 4 === 0 ? "rgba(255,255,255,0.1)" : "rgba(255,255,255,0.03)",
+                boxShadow: on && isPlaying ? "0 0 10px " + colors[row] + "88" : "none"
+              }
+            });
+          })
+        )
+      );
+    })
+  );
+}
+
+function Chip(props) {
+  var on = useState(false);
+  var setOn = on[1];
+  on = on[0];
+
+  var press = useCallback(function() {
+    setOn(true);
+    var freq = noteToFreq(props.s.note);
+    if (freq) {
+      holdNote(props.id, {
+        freq: freq,
+        type: props.s.type,
+        attack: props.s.attack,
+        vol: Math.pow(10, (props.s.volume || -8) / 20) * 0.7,
+        reverb: props.s.reverb,
+        delay: props.s.delay,
+        distortion: props.s.distortion
+      });
+    }
+  }, [props.id, props.s]);
+
+  var lift = useCallback(function() {
+    setOn(false);
+    releaseNote(props.id);
+  }, [props.id]);
+
+  useEffect(function() {
+    return function() {
+      if (on) lift();
+    };
+  }, [on, lift]);
+
+  var fx = [];
+  if (props.s.reverb > 0) fx.push("rv");
+  if (props.s.delay > 0) fx.push("dl");
+  if (props.s.distortion > 0) fx.push("fx");
+
+  return createElement("div", {
+    className: "chip " + (on ? "active" : ""),
+    onMouseDown: press,
+    onMouseUp: lift,
+    onMouseLeave: function() { if (on) lift(); },
+    onTouchStart: function(e) { e.preventDefault(); press(); },
+    onTouchEnd: function(e) { e.preventDefault(); lift(); }
+  },
+    createElement("div", { className: "chip-id" }, props.id.toUpperCase()),
+    createElement("div", { className: "chip-note" }, props.s.note),
+    createElement("div", { className: "chip-fx" }, props.s.type + (fx.length ? " · " + fx.join(" ") : ""))
+  );
+}
+
+function TrackChip(props) {
+  var playing = useState(false);
+  var setPlaying = playing[1];
+  playing = playing[0];
+  var sourceRef = useRef(null);
+
+  var play = useCallback(function() {
+    if (playing) {
+      if (sourceRef.current) {
+        try { sourceRef.current.stop(); } catch(e) {}
+      }
+      setPlaying(false);
+      return;
+    }
+    audioManager.resume().then(function(ctx) {
+      var source = ctx.createBufferSource();
+      source.buffer = props.track.buffer;
+      source.connect(getMasterBus().getInputNode());
+      source.start();
+      sourceRef.current = source;
+      setPlaying(true);
+      source.onended = function() { setPlaying(false); };
+    });
+  }, [playing, props.track.buffer]);
+
+  useEffect(function() {
+    return function() {
+      if (sourceRef.current) {
+        try { sourceRef.current.stop(); } catch(e) {}
+      }
+    };
+  }, []);
+
+  return createElement("div", { className: "track-chip" },
+    createElement("div", { className: "track-info" },
+      createElement("div", { className: "track-name" }, props.track.name),
+      createElement("div", { className: "track-meta" },
+        props.track.duration.toFixed(1) + "s",
+        props.track.dominantNote ? createElement("span", { className: "track-note" }, "~" + props.track.dominantNote) : null
+      )
+    ),
+    createElement("button", { onClick: play, className: "track-btn " + (playing ? "active" : "") }, playing ? "■" : "▶"),
+    createElement("button", { onClick: props.onExport, className: "track-btn export", title: "Export WAV" }, "⬇"),
+    createElement("button", { onClick: props.onDelete, className: "track-btn delete" }, "×")
+  );
+}
+
+function RecordingPanel(props) {
+  var recState = useState("idle");
+  var setRecState = recState[1];
+  recState = recState[0];
+  var tracks = useState([]);
+  var setTracks = tracks[1];
+  tracks = tracks[0];
+  var error = useState("");
+  var setError = error[1];
+  error = error[0];
+  var recordingTime = useState(0);
+  var setRecordingTime = recordingTime[1];
+  recordingTime = recordingTime[0];
+  var micLevel = useState(0);
+  var setMicLevel = micLevel[1];
+  micLevel = micLevel[0];
+  var levelLabel = useState("NO SIGNAL");
+  var setLevelLabel = levelLabel[1];
+  levelLabel = levelLabel[0];
+  var levelColor = useState("rgba(255,255,255,0.08)");
+  var setLevelColor = levelColor[1];
+  levelColor = levelColor[0];
+
+  var mediaRecRef = useRef(null);
+  var chunksRef = useRef([]);
+  var timerRef = useRef(null);
+  var streamRef = useRef(null);
+  var analyserRef = useRef(null);
+  var sourceRef = useRef(null);
+  var levelRafRef = useRef(null);
+
+  useEffect(function() {
+    return function() {
+      if (levelRafRef.current) cancelAnimationFrame(levelRafRef.current);
+      if (streamRef.current) streamRef.current.getTracks().forEach(function(t) { t.stop(); });
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, []);
+
+  var startLevelMeter = useCallback(function(stream) {
+    var ctx = audioManager.get();
+    if (sourceRef.current) {
+      try { sourceRef.current.disconnect(); } catch(e) {}
+    }
+    if (analyserRef.current) {
+      try { analyserRef.current.disconnect(); } catch(e) {}
+    }
+    var source = ctx.createMediaStreamSource(stream);
+    var analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+    sourceRef.current = source;
+    analyserRef.current = analyser;
+    var data = new Uint8Array(analyser.frequencyBinCount);
+
+    function tick() {
+      analyser.getByteFrequencyData(data);
+      var avg = data.reduce(function(a, b) { return a + b; }, 0) / data.length;
+      var pct = Math.min(100, (avg / 128) * 100);
+      setMicLevel(pct);
+      if (pct < 3) { setLevelLabel("NO SIGNAL"); setLevelColor("rgba(255,255,255,0.08)"); }
+      else if (pct < 15) { setLevelLabel("LOW"); setLevelColor("#FBBF24"); }
+      else if (pct < 65) { setLevelLabel("GOOD"); setLevelColor("#34D399"); }
+      else { setLevelLabel("HOT"); setLevelColor("#F87171"); }
+      levelRafRef.current = requestAnimationFrame(tick);
+    }
+    tick();
+  }, []);
+
+  var stopLevelMeter = useCallback(function() {
+    if (levelRafRef.current) cancelAnimationFrame(levelRafRef.current);
+    if (sourceRef.current) {
+      try { sourceRef.current.disconnect(); } catch(e) {}
+      sourceRef.current = null;
+    }
+    if (analyserRef.current) {
+      try { analyserRef.current.disconnect(); } catch(e) {}
+      analyserRef.current = null;
+    }
+    setMicLevel(0);
+  }, []);
+
+  var enableMic = useCallback(function() {
+    navigator.mediaDevices.getUserMedia({ audio: true, video: false }).then(function(stream) {
+      streamRef.current = stream;
+      setRecState("ready");
+      setError("");
+      startLevelMeter(stream);
+    }).catch(function(e) {
+      setError("Microphone access denied. Check browser settings.");
+      console.error("Mic access error:", e);
+    });
+  }, [startLevelMeter]);
+
+  var startRecording = useCallback(function() {
+    if (!streamRef.current) return;
+    chunksRef.current = [];
+    var mr = new MediaRecorder(streamRef.current, { mimeType: "audio/webm;codecs=opus" });
+    mr.ondataavailable = function(e) { if (e.data.size > 0) chunksRef.current.push(e.data); };
+    mr.onstop = function() { processRecording(); };
+    mr.start(100);
+    mediaRecRef.current = mr;
+    setRecState("recording");
+    setRecordingTime(0);
+    timerRef.current = setInterval(function() { setRecordingTime(function(t) { return t + 1; }); }, 1000);
+  }, []);
+
+  var stopRecording = useCallback(function() {
+    if (mediaRecRef.current && mediaRecRef.current.state !== "inactive") {
+      mediaRecRef.current.stop();
+    }
+    if (timerRef.current) clearInterval(timerRef.current);
+    setRecState("processing");
+  }, []);
+
+  var processRecording = useCallback(function() {
+    stopLevelMeter();
+    var blob = new Blob(chunksRef.current, { type: "audio/webm" });
+    blob.arrayBuffer().then(function(arrayBuffer) {
+      return audioManager.resume().then(function(ctx) {
+        return ctx.decodeAudioData(arrayBuffer);
+      });
+    }).then(function(audioBuffer) {
+      var result = analyzePitch(audioBuffer);
+      var duration = audioBuffer.duration;
+      var trackName = "TRACK " + (tracks.length + 1);
+      var track = {
+        name: trackName,
+        buffer: audioBuffer,
+        duration: duration,
+        dominantNote: result.note,
+        freq: result.freq,
+        rms: result.rms,
+        confidence: result.confidence,
+        blob: blob
+      };
+      setTracks(function(prev) { return prev.concat([track]); });
+      var analysis = {
+        trackName: trackName,
+        duration: duration.toFixed(1),
+        dominantNote: result.note || "unclear",
+        detectedFrequency: result.freq ? Math.round(result.freq) + "Hz" : "unclear",
+        signalStrength: result.rms > 0.05 ? "strong" : result.rms > 0.005 ? "moderate" : "very quiet",
+        confidence: result.confidence ? (result.confidence * 100).toFixed(1) + "%" : "low",
+        sampleRate: audioBuffer.sampleRate
+      };
+      props.onAnalysisReady(analysis);
+      setRecState("ready");
+    }).catch(function(e) {
+      console.error("Recording processing error:", e);
+      setError("Could not process recording: " + e.message);
+      setRecState("ready");
+    });
+  }, [tracks.length, stopLevelMeter, props.onAnalysisReady]);
+
+  var deleteTrack = useCallback(function(i) {
+    setTracks(function(prev) { return prev.filter(function(_, idx) { return idx !== i; }); });
+  }, []);
+
+  var levelPct = Math.min(100, micLevel);
+
+  return createElement("div", { className: "recording-panel" },
+    createElement("div", { className: "rec-header" },
+      createElement("span", { className: "rec-label" }, "REC"),
+      recState === "idle" ? createElement("button", { onClick: enableMic, className: "rec-btn enable" }, "🎙 ENABLE MIC") : null,
+      (recState === "ready" || recState === "recording") ? [
+        createElement("div", { key: "bar", className: "level-bar" },
+          createElement("div", { className: "level-fill", style: { width: levelPct + "%", background: levelColor } })
+        ),
+        createElement("span", { key: "text", className: "level-text", style: { color: levelColor } }, levelLabel)
+      ] : null,
+      recState === "ready" ? createElement("button", { onClick: startRecording, className: "rec-btn record" }, "● RECORD") : null,
+      recState === "recording" ? createElement("div", { className: "recording-active" },
+        createElement("div", { className: "rec-dot" }),
+        createElement("span", { className: "rec-time" }, recordingTime + "s"),
+        createElement("button", { onClick: stopRecording, className: "rec-btn stop" }, "■ STOP")
+      ) : null,
+      recState === "processing" ? createElement("span", { className: "processing-text" }, "Analyzing your track...") : null,
+      error ? createElement("span", { className: "rec-error" }, error) : null
+    ),
+    tracks.length > 0 ? createElement("div", { className: "tracks-list" },
+      tracks.map(function(track, i) {
+        return createElement(TrackChip, {
+          key: track.name + "_" + i,
+          track: track,
+          onPlay: function() {},
+          onDelete: function() { deleteTrack(i); },
+          onExport: function() {}
+        });
+      })
+    ) : null
+  );
+}
+
+function ApiKeyInput(props) {
+  var key = useState(getStoredApiKey() || "");
+  var setKey = key[1];
+  key = key[0];
+  var visible = useState(false);
+  var setVisible = visible[1];
+  visible = visible[0];
+
+  return createElement("div", { className: "api-key-panel" },
+    createElement("span", { className: "api-key-label" }, "Claude API Key"),
+    createElement("div", { className: "api-key-row" },
+      createElement("input", {
+        type: visible ? "text" : "password",
+        value: key,
+        onChange: function(e) { setKey(e.target.value); },
+        placeholder: "sk-ant-api03-...",
+        className: "api-key-input"
+      }),
+      createElement("button", { onClick: function() { setVisible(function(v) { return !v; }); }, className: "api-key-toggle" }, visible ? "🙈" : "👁"),
+      createElement("button", {
+        onClick: function() {
+          if (key.trim()) { setStoredApiKey(key.trim()); props.onKeySet(key.trim()); }
+        },
+        className: "api-key-save"
+      }, "Save"),
+      createElement("button", {
+        onClick: function() { clearStoredApiKey(); setKey(""); props.onKeySet(null); },
+        className: "api-key-clear"
+      }, "Clear")
+    ),
+    createElement("p", { className: "api-key-hint" }, "Your key is stored locally in your browser. Without a key, Co-Co runs in offline mode with presets.")
+  );
+}
+
+function App() {
+  var saved = loadSession();
+  var phaseState = useState("splash");
+  var setPhase = phaseState[1];
+  var phase = phaseState[0];
+
+  var messagesState = useState(saved && saved.messages ? saved.messages : [{
+    role: "assistant",
+    text: "Hey. I've been waiting for you.
+
+Tell me what's in your head — or pick up your instrument and let's record something. Either way, we're making something real today.
+
+What are we starting with?",
+    rawJson: null
+  }]);
+  var setMessages = messagesState[1];
+  var messages = messagesState[0];
+
+  var inputState = useState("");
+  var setInput = inputState[1];
+  var input = inputState[0];
+
+  var loadingState = useState(false);
+  var setLoading = loadingState[1];
+  var loading = loadingState[0];
+
+  var soundsState = useState(saved && saved.sounds ? saved.sounds : {});
+  var setSounds = soundsState[1];
+  var sounds = soundsState[0];
+
+  var patternState = useState(saved && saved.pattern ? saved.pattern : EMPTY_PATTERN);
+  var setPattern = patternState[1];
+  var pattern = patternState[0];
+
+  var bpmState = useState(saved && saved.bpm ? saved.bpm : 90);
+  var setBpm = bpmState[1];
+  var bpm = bpmState[0];
+
+  var playingState = useState(false);
+  var setPlaying = playingState[1];
+  var playing = playingState[0];
+
+  var activeStepState = useState(-1);
+  var setActiveStep = activeStepState[1];
+  var activeStep = activeStepState[0];
+
+  var showBeatState = useState(false);
+  var setShowBeat = showBeatState[1];
+  var showBeat = showBeatState[0];
+
+  var showRecState = useState(false);
+  var setShowRec = showRecState[1];
+  var showRec = showRecState[0];
+
+  var showApiKeyState = useState(false);
+  var setShowApiKey = showApiKeyState[1];
+  var showApiKey = showApiKeyState[0];
+
+  var apiKeyState = useState(getStoredApiKey);
+  var setApiKey = apiKeyState[1];
+  var apiKey = apiKeyState[0];
+
+  var masterVolumeState = useState(-6);
+  var setMasterVolume = masterVolumeState[1];
+  var masterVolume = masterVolumeState[0];
+
+  var ctxStateState = useState("suspended");
+  var setCtxState = ctxStateState[1];
+  var ctxState = ctxStateState[0];
+
+  var chatRef = useRef(null);
+  var inputRef = useRef(null);
+
+  useEffect(function() {
+    getMasterBus().setVolume(masterVolume);
+  }, [masterVolume]);
+
+  useEffect(function() {
+    var unsub = audioManager.onStateChange(function(state) { setCtxState(state); });
+    return unsub;
+  }, []);
+
+  useEffect(function() {
+    sequencer.onStep = function(s) { setActiveStep(s); };
+    return function() { sequencer.onStep = null; };
+  }, []);
+
+  useEffect(function() {
+    if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
+  }, [messages, loading]);
+
+  useEffect(function() {
+    var timer = setTimeout(function() {
+      saveSession({ sounds: sounds, pattern: pattern, bpm: bpm, messages: messages });
+    }, 2000);
+    return function() { clearTimeout(timer); };
+  }, [sounds, pattern, bpm, messages]);
+
+  useEffect(function() {
+    return function() {
+      releaseAllNotes();
+      sequencer.stop();
+    };
+  }, []);
+
+  var activate = useCallback(function() {
+    audioManager.resume().then(function(ctx) {
+      var notes = [220, 277, 330];
+      notes.forEach(function(f, i) {
+        var o = ctx.createOscillator();
+        var g = ctx.createGain();
+        o.type = "sine";
+        o.frequency.value = f;
+        g.gain.setValueAtTime(0, ctx.currentTime + i * 0.08);
+        g.gain.linearRampToValueAtTime(0.1, ctx.currentTime + i * 0.08 + 0.15);
+        g.gain.linearRampToValueAtTime(0, ctx.currentTime + i * 0.08 + 2.0);
+        o.connect(g);
+        g.connect(getMasterBus().getInputNode());
+        o.start(ctx.currentTime + i * 0.08);
+        o.stop(ctx.currentTime + i * 0.08 + 2.2);
+      });
+      setPhase("ready");
+      setTimeout(function() { if (inputRef.current) inputRef.current.focus(); }, 300);
+    }).catch(function(e) {
+      console.error("Audio activation failed:", e);
+      alert("Could not initialize audio. Please check your browser supports Web Audio API.");
+    });
+  }, []);
+
+  var toggleStep = useCallback(function(row, i) {
+    setPattern(function(prev) {
+      var next = Object.assign({}, prev);
+      next[row] = prev[row].slice();
+      next[row][i] = next[row][i] ? 0 : 1;
+      sequencer.setPattern(next);
+      return next;
+    });
+  }, []);
+
+  var handleBPM = useCallback(function(v) {
+    var clamped = Math.max(60, Math.min(180, v));
+    setBpm(clamped);
+    sequencer.setBPM(clamped);
+  }, []);
+
+  var startBeat = useCallback(function() {
+    sequencer.setBPM(bpm);
+    sequencer.setPattern(pattern);
+    sequencer.start().then(function() {
+      setPlaying(true);
+    });
+  }, [bpm, pattern]);
+
+  var stopBeat = useCallback(function() {
+    sequencer.stop();
+    setPlaying(false);
+    setActiveStep(-1);
+  }, []);
+
+  var applyPreset = useCallback(function(presetName) {
+    var preset = OFFLINE_PRESETS[presetName];
+    if (!preset) return;
+    var validatedSounds = {};
+    preset.sounds.forEach(function(s) {
+      var vs = validateSound(s);
+      if (vs) validatedSounds[vs.name] = vs;
+    });
+    setSounds(validatedSounds);
+    var beat = validateBeat(preset.beat);
+    if (beat) {
+      setPattern(beat);
+      setBpm(beat.bpm);
+      sequencer.setPattern(beat);
+      sequencer.setBPM(beat.bpm);
+    }
+    preset.play.forEach(function(name) {
+      var s = validatedSounds[name];
+      if (s) {
+        var freq = noteToFreq(s.note);
+        if (freq) {
+          playNote({
+            freq: freq,
+            type: s.type,
+            attack: s.attack,
+            release: s.release,
+            vol: Math.pow(10, (s.volume || -8) / 20) * 0.7,
+            reverb: s.reverb,
+            delay: s.delay,
+            distortion: s.distortion
+          });
+        }
+      }
+    });
+    setShowBeat(true);
+    if (!playing) {
+      sequencer.start().then(function() { setPlaying(true); });
+    }
+  }, [playing]);
+
+  var handleAnalysis = useCallback(function(analysis) {
+    var msg = "[TRACK RECORDED]
+Name: " + analysis.trackName + "
+Duration: " + analysis.duration + " seconds
+Dominant note: " + analysis.dominantNote + "
+Frequency: " + analysis.detectedFrequency + "
+Confidence: " + analysis.confidence + "
+Signal: " + analysis.signalStrength + "
+
+I just recorded this. What do you hear?";
+    sendMessage(msg, true);
+  }, []);
+
+  var sendMessage = useCallback(function(text, isSystem) {
+    isSystem = isSystem || false;
+    var displayText = isSystem ? "🎙 Recorded " + (text.match(/Name: (.+)/) || ["", "a track"])[1] + " — sending to Co-Co..." : text;
+    var hist = messages.concat([{ role: "user", text: isSystem ? displayText : text }]);
+    setMessages(hist);
+    setLoading(true);
+
+    var apiKey = getStoredApiKey();
+    if (!apiKey) {
+      setMessages(function(p) {
+        return p.concat([{
+          role: "assistant",
+          text: "No API key found — running in offline mode.
+
+I hear you. Let me pull something up from the studio archives.
+
+Try one of these vibes:
+- **ambient** — spacious pads, slow burn
+- **driving** — energetic, forward momentum
+- **chill** — laid back, melodic
+
+Or type the name and I'll load it.",
+          rawJson: null
+        }]);
+      });
+      setLoading(false);
+      return;
+    }
+
+    var apiMessages = hist.map(function(m) {
+      return {
+        role: m.role,
+        content: m.role === "assistant" && m.rawJson
+          ? m.text + "
+```json
+" + JSON.stringify(m.rawJson) + "
+```"
+          : isSystem && m === hist[hist.length - 1] ? text : m.text
+      };
+    });
+
+    fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        system: SYSTEM_PROMPT,
+        messages: apiMessages
+      })
+    }).then(function(res) {
+      if (!res.ok) return res.text().then(function(t) { throw new Error("API " + res.status + ": " + t); });
+      return res.json();
+    }).then(function(data) {
+      var raw = (data.content || []).map(function(b) { return b.text || ""; }).join("") || "";
+      var jm = raw.match(/```json\s*([\s\S]*?)```/);
+      var parsed = null;
+      var display = raw.replace(/```json[\s\S]*?```/g, "").trim();
+      if (jm) {
+        try { parsed = JSON.parse(jm[1]); } catch(e) {}
+      }
+
+      if (parsed && parsed.sounds) {
+        var next = Object.assign({}, sounds);
+        parsed.sounds.forEach(function(s) {
+          var vs = validateSound(s);
+          if (vs) next[vs.name] = vs;
+        });
+        setSounds(next);
+        if (parsed.play && parsed.play.length) {
+          parsed.play.forEach(function(name) {
+            var s = parsed.sounds.find(function(x) { return x.name === name; });
+            if (s) {
+              var freq = noteToFreq(s.note);
+              if (freq) {
+                playNote({
+                  freq: freq,
+                  type: s.type,
+                  attack: s.attack || 0.05,
+                  release: s.release || 1.5,
+                  vol: Math.pow(10, (s.volume || -8) / 20) * 0.7,
+                  reverb: s.reverb || 0,
+                  delay: s.delay || 0,
+                  distortion: s.distortion || 0
+                });
+              }
+            }
+          });
+        }
+      }
+
+      if (parsed && parsed.beat) {
+        var b = validateBeat(parsed.beat);
+        if (b) {
+          setPattern(b);
+          setBpm(b.bpm);
+          sequencer.setPattern(b);
+          sequencer.setBPM(b.bpm);
+          setShowBeat(true);
+          if (!playing) {
+            sequencer.start().then(function() { setPlaying(true); });
+          }
+        }
+      }
+
+      setMessages(function(p) {
+        return p.concat([{ role: "assistant", text: display || "There it is.", rawJson: parsed }]);
+      });
+    }).catch(function(e) {
+      console.error("Message send failed:", e);
+      setMessages(function(p) {
+        return p.concat([{ role: "assistant", text: "Lost the signal: " + e.message + ". Try again or check your API key." }]);
+      });
+    }).finally(function() {
+      setLoading(false);
+    });
+  }, [messages, sounds, playing]);
+
+  var send = useCallback(function() {
+    if (!input.trim() || loading) return;
+    var t = input.trim();
+    setInput("");
+    var lower = t.toLowerCase();
+    if (["ambient", "driving", "chill"].indexOf(lower) !== -1) {
+      applyPreset(lower);
+      setMessages(function(p) {
+        return p.concat([
+          { role: "user", text: t },
+          { role: "assistant", text: "Loaded the **" + lower + "** preset. Give it a listen — hold the sound chips to play, or let the beat run. Want to tweak anything?", rawJson: null }
+        ]);
+      });
+      return;
+    }
+    sendMessage(t);
+  }, [input, loading, sendMessage, applyPreset]);
+
+  // SPLASH SCREEN
+  if (phase === "splash") {
+    return createElement("div", { className: "splash" },
+      createElement("div", { className: "splash-icon" }, "◈"),
+      createElement("div", { className: "splash-title" }, "CONDUCTOR"),
+      createElement("div", { className: "splash-subtitle" }, "YOUR AI CREATIVE PARTNER"),
+      createElement("p", { className: "splash-desc" }, "No knobs. No manuals. No limits.
+Just tell me what's in your head —
+or pick up your instrument."),
+      createElement("button", { onClick: activate, className: "splash-btn" }, "LET'S CREATE"),
+      createElement("p", { className: "splash-hint" }, "tap to unlock audio · mic access required for recording")
+    );
+  }
+
+  // MAIN UI
+  return createElement("div", { className: "app" },
+    // Header
+    createElement("header", { className: "header" },
+      createElement("div", { className: "header-brand" },
+        createElement("div", { className: "header-icon" }, "◈"),
+        createElement("div", null,
+          createElement("div", { className: "header-title" }, "CONDUCTOR"),
+          createElement("div", { className: "header-subtitle" }, "AI CREATIVE PARTNER")
+        )
+      ),
+      createElement("div", { className: "header-controls" },
+        createElement("div", { className: "volume-control" },
+          createElement("span", { className: "vol-label" }, "VOL"),
+          createElement("input", {
+            type: "range", min: -30, max: 0, value: masterVolume,
+            onChange: function(e) { setMasterVolume(Number(e.target.value)); },
+            className: "vol-slider"
+          }),
+          createElement("span", { className: "vol-value" }, masterVolume + "dB")
+        ),
+        createElement("button", {
+          onClick: function() { setShowApiKey(function(p) { return !p; }); },
+          className: "header-btn " + (showApiKey ? "active" : "")
+        }, "🔑"),
+        createElement("button", {
+          onClick: function() { setShowRec(function(p) { return !p; }); },
+          className: "header-btn " + (showRec ? "active" : "")
+        }, "🎙 REC"),
+        createElement("button", {
+          onClick: function() { setShowBeat(function(p) { return !p; }); },
+          className: "header-btn " + (showBeat ? "active" : "")
+        }, "BEAT"),
+        createElement("div", { className: "status-badge " + (ctxState === "running" ? "live" : "") },
+          createElement("div", { className: "status-dot" }),
+          ctxState === "running" ? "LIVE" : ctxState.toUpperCase()
+        )
+      )
+    ),
+
+    // API Key Panel
+    showApiKey ? createElement(ApiKeyInput, { onKeySet: setApiKey }) : null,
+
+    // Visualizer
+    createElement("div", { className: "visualizer-container" },
+      createElement(Visualizer, { playing: playing, recording: showRec, activeNotes: noteTracker.activeCount }),
+      createElement("div", { className: "visualizer-overlay" })
+    ),
+
+    // Recording Panel
+    showRec ? createElement(RecordingPanel, { onAnalysisReady: handleAnalysis }) : null,
+
+    // Beat Grid
+    showBeat ? createElement(StepGrid, {
+      pattern: pattern,
+      activeStep: activeStep,
+      onToggle: toggleStep,
+      bpm: bpm,
+      onBPM: handleBPM,
+      playing: playing,
+      onPlay: startBeat,
+      onStop: stopBeat
+    }) : null,
+
+    // Offline Presets
+    !apiKey ? createElement("div", { className: "presets-bar" },
+      createElement("span", { className: "presets-label" }, "OFFLINE PRESETS"),
+      Object.keys(OFFLINE_PRESETS).map(function(name) {
+        return createElement("button", {
+          key: name,
+          onClick: function() { applyPreset(name); },
+          className: "preset-btn"
+        }, name.toUpperCase());
+      })
+    ) : null,
+
+    // Sound Chips
+    Object.keys(sounds).length > 0 ? createElement("div", { className: "chips-bar" },
+      createElement("span", { className: "chips-label" }, "HOLD TO PLAY"),
+      Object.keys(sounds).map(function(id) {
+        return createElement(Chip, { key: id, id: id, s: sounds[id] });
+      })
+    ) : null,
+
+    // Chat
+    createElement("div", { ref: chatRef, className: "chat" },
+      messages.map(function(m, i) {
+        return createElement("div", { key: i, className: "msg " + m.role },
+          m.role === "assistant" ? createElement("div", { className: "msg-avatar" },
+            createElement("span", null, "◈"),
+            createElement("span", { className: "msg-name" }, "CO-CO")
+          ) : null,
+          createElement("div", { className: "msg-bubble" }, m.text)
+        );
+      }),
+      loading ? createElement("div", { className: "msg-loading" },
+        createElement("span", null, "◈"),
+        createElement("div", { className: "loading-dots" },
+          createElement("div", null),
+          createElement("div", null),
+          createElement("div", null)
+        )
+      ) : null
+    ),
+
+    // Input
+    createElement("div", { className: "input-bar" },
+      createElement("div", { className: "input-row" },
+        createElement("textarea", {
+          ref: inputRef,
+          value: input,
+          onChange: function(e) { setInput(e.target.value); },
+          onKeyDown: function(e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } },
+          placeholder: "Tell Co-Co what's in your head...",
+          rows: 2,
+          className: "input-textarea"
+        }),
+        createElement("button", {
+          onClick: send,
+          disabled: loading || !input.trim(),
+          className: "input-send"
+        }, loading ? "⟳" : "▶")
+      ),
+      createElement("p", { className: "input-hint" }, "🎙 REC to record · BEAT for sequencer · Enter to send · Try ambient, driving, or chill in offline mode")
+    )
+  );
+}
+
+// ============================================================
+// RENDER
+// ============================================================
+var root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(createElement(App));
+})();
