@@ -1170,11 +1170,7 @@ function App() {
 
   var messagesState = useState(saved && saved.messages ? saved.messages : [{
     role: "assistant",
-    text: "Hey. I've been waiting for you.
-
-Tell me what's in your head — or pick up your instrument and let's record something. Either way, we're making something real today.
-
-What are we starting with?",
+    text: "Hey. I've been waiting for you.\n\nTell me what's in your head — or pick up your instrument and let's record something. Either way, we're making something real today.\n\nWhat are we starting with?",
     rawJson: null
   }]);
   var setMessages = messagesState[1];
