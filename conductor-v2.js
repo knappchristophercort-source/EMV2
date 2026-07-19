@@ -1358,15 +1358,7 @@ function App() {
   }, [playing]);
 
   var handleAnalysis = useCallback(function(analysis) {
-    var msg = "[TRACK RECORDED]
-Name: " + analysis.trackName + "
-Duration: " + analysis.duration + " seconds
-Dominant note: " + analysis.dominantNote + "
-Frequency: " + analysis.detectedFrequency + "
-Confidence: " + analysis.confidence + "
-Signal: " + analysis.signalStrength + "
-
-I just recorded this. What do you hear?";
+    var msg = "[TRACK RECORDED]\nName: " + analysis.trackName + "\nDuration: " + analysis.duration + " seconds\nDominant note: " + analysis.dominantNote + "\nFrequency: " + analysis.detectedFrequency + "\nConfidence: " + analysis.confidence + "\nSignal: " + analysis.signalStrength + "\n\nI just recorded this. What do you hear?";
     sendMessage(msg, true);
   }, []);
 
@@ -1382,16 +1374,7 @@ I just recorded this. What do you hear?";
       setMessages(function(p) {
         return p.concat([{
           role: "assistant",
-          text: "No API key found — running in offline mode.
-
-I hear you. Let me pull something up from the studio archives.
-
-Try one of these vibes:
-- **ambient** — spacious pads, slow burn
-- **driving** — energetic, forward momentum
-- **chill** — laid back, melodic
-
-Or type the name and I'll load it.",
+          text: "No API key found — running in offline mode.\n\nI hear you. Let me pull something up from the studio archives.\n\nTry one of these vibes:\n- **ambient** — spacious pads, slow burn\n- **driving** — energetic, forward momentum\n- **chill** — laid back, melodic\n\nOr type the name and I'll load it.",
           rawJson: null
         }]);
       });
@@ -1403,10 +1386,7 @@ Or type the name and I'll load it.",
       return {
         role: m.role,
         content: m.role === "assistant" && m.rawJson
-          ? m.text + "
-```json
-" + JSON.stringify(m.rawJson) + "
-```"
+          ? m.text + "\n```json\n" + JSON.stringify(m.rawJson) + "\n```"
           : isSystem && m === hist[hist.length - 1] ? text : m.text
       };
     });
@@ -1516,9 +1496,7 @@ Or type the name and I'll load it.",
       createElement("div", { className: "splash-icon" }, "◈"),
       createElement("div", { className: "splash-title" }, "CONDUCTOR"),
       createElement("div", { className: "splash-subtitle" }, "YOUR AI CREATIVE PARTNER"),
-      createElement("p", { className: "splash-desc" }, "No knobs. No manuals. No limits.
-Just tell me what's in your head —
-or pick up your instrument."),
+      createElement("p", { className: "splash-desc" }, "No knobs. No manuals. No limits.\nJust tell me what's in your head —\nor pick up your instrument."),
       createElement("button", { onClick: activate, className: "splash-btn" }, "LET'S CREATE"),
       createElement("p", { className: "splash-hint" }, "tap to unlock audio · mic access required for recording")
     );
